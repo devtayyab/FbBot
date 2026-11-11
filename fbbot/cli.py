@@ -1,4 +1,4 @@
-"""Command line: login, scan, review, post, run, loop, status, try."""
+"""Command line: login, scan, review, post, run, loop, status, history, try."""
 from __future__ import annotations
 
 import argparse
@@ -10,7 +10,7 @@ import time
 import webbrowser
 
 from .browser import NotLoggedIn, open_browser
-from .config import load_config
+from .config import HISTORY_CSV, load_config
 from .store import Store
 
 CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
@@ -47,8 +47,6 @@ def cmd_login(cfg: dict, args) -> None:
 # ---- scan -----------------------------------------------------------------
 
 def cmd_scan(cfg: dict, args) -> None:
-    import anthropic
-
     from .drafter import Drafter  # imported here so `login` works without an API key
     from .scraper import scrape_group
 
@@ -81,15 +79,14 @@ def cmd_scan(cfg: dict, args) -> None:
                     analysis = drafter.analyze(post["text"], first_time_poster=first_time)
                 except Exception as exc:  # API or parse error: retry this post next scan
                     store.discard_post(post["post_id"])
-                    if isinstance(exc, (anthropic.AuthenticationError, anthropic.PermissionDeniedError,
-                                        anthropic.NotFoundError)):
+                    if isinstance(exc, drafter.setup_errors):
                         # Every post would fail the same way: stop instead of trying each one.
-                        raise SystemExit(f"Claude API setup problem (check .env key and llm.model): {exc}")
+                        raise SystemExit(f"AI model setup problem (check the API key in .env and llm settings): {exc}")
                     draft_errors += 1
                     print(f"  drafting failed, will retry next scan: {exc!r}")
                     continue
                 if analysis is None:
-                    store.set_status(post["post_id"], "ignored", "Claude declined to draft")
+                    store.set_status(post["post_id"], "ignored", "model declined to draft")
                     continue
                 if not analysis.relevant:
                     store.save_analysis(post["post_id"], analysis.model_dump(), "ignored")
@@ -98,7 +95,7 @@ def cmd_scan(cfg: dict, args) -> None:
                 drafted += 1
                 store.save_analysis(post["post_id"], analysis.model_dump(), "pending")
                 if auto and CONFIDENCE_RANK[analysis.confidence] >= min_rank:
-                    store.approve(post["post_id"], analysis.reply)
+                    store.approve(post["post_id"], analysis.reply, by="auto")
                     auto_approved += 1
                 tag = " [first-time poster]" if first_time else ""
                 print(f"  + {post.get('author_name') or '?'}{tag}: {analysis.reply}")
@@ -134,12 +131,12 @@ def _review(store: Store) -> None:
         while True:
             choice = input("> ").strip().lower()
             if choice == "a":
-                store.approve(row["post_id"], row["draft"])
+                store.approve(row["post_id"], row["draft"], by="review")
                 break
             if choice == "e":
                 new = input("Your comment: ").strip()
                 if new:
-                    store.approve(row["post_id"], new)
+                    store.approve(row["post_id"], new, by="edited")
                     break
             elif choice == "s":
                 store.set_status(row["post_id"], "skipped")
@@ -182,8 +179,8 @@ def _post(cfg: dict, args, store: Store) -> None:
             try:
                 post_comment(ctx, row["url"], row["final_comment"], pc["comment_box_labels"], dry_run=args.dry_run)
             except PostUnverified as exc:
-                store.mark_unverified(row["post_id"], str(exc))  # counts toward max_per_day
-                print(f"  failed: {exc}")
+                store.mark_unverified(row["post_id"], str(exc))  # in history, counts toward max_per_day
+                print(f"  unverified: {exc}")
                 continue
             except PostError as exc:
                 if not args.dry_run:  # a dry run must not change the queue
@@ -193,6 +190,9 @@ def _post(cfg: dict, args, store: Store) -> None:
             if not args.dry_run:
                 store.mark_posted(row["post_id"])
                 print("  posted")
+    if not args.dry_run:
+        store.export_history(HISTORY_CSV)
+        print(f"History updated: {HISTORY_CSV}")
 
 
 # ---- run / loop / status / try ---------------------------------------------
@@ -222,8 +222,26 @@ def cmd_status(cfg: dict, args) -> None:
         counts = store.counts()
         print("Posts by status:", counts or "none yet")
         print("Posted today:", store.posted_today())
-        for row in store.by_status("failed")[-5:]:
-            print(f"  failed: {row['url']} -> {row['error']}")
+        for status in ("failed", "unverified"):
+            for row in store.by_status(status)[-5:]:
+                print(f"  {status}: {row['url']} -> {row['error']}")
+
+
+def cmd_history(cfg: dict, args) -> None:
+    """Show the posts the bot commented on, newest first, and refresh the CSV."""
+    with Store() as store:
+        rows = store.history(limit=args.limit)
+        total = store.export_history(HISTORY_CSV)
+    if not rows:
+        print("No comments posted yet.")
+        return
+    for r in rows:
+        mark = "" if r["status"] == "posted" else f"  [{r['status']}]"
+        print(f"{r['posted_at']}  {r['author_name'] or '?'}  ({r['approved_by'] or '?'}){mark}")
+        print(f"  post:    {(r['text'] or '').replace(chr(10), ' ')[:110]}")
+        print(f"  comment: {r['final_comment']}")
+        print(f"  {r['url']}\n")
+    print(f"Showing {len(rows)} of {total}. Full history: {HISTORY_CSV}")
 
 
 def cmd_try(cfg: dict, args) -> None:
@@ -231,7 +249,7 @@ def cmd_try(cfg: dict, args) -> None:
     from .drafter import Drafter
 
     analysis = Drafter(cfg).analyze(args.text)
-    print(analysis.model_dump_json(indent=2) if analysis else "Claude declined to draft a reply.")
+    print(analysis.model_dump_json(indent=2) if analysis else "The model declined to draft a reply.")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -251,6 +269,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--debug", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     sub.add_parser("status", help="show counts and recent failures")
+    p = sub.add_parser("history", help="list posts the bot commented on and write data/comment_history.csv")
+    p.add_argument("--limit", type=int, default=20, help="how many to show (the CSV always has all)")
     p = sub.add_parser("try", help="draft a reply for some text without touching Facebook")
     p.add_argument("text")
 

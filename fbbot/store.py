@@ -2,11 +2,14 @@
 
 Post status flow:
     ignored              not a visitor/question, too old, or no text
-    pending  -> approved -> posted | failed
+    pending  -> approved -> posted | unverified | failed
              -> skipped
+
+Comment history = every row with posted_at set (posted or unverified).
 """
 from __future__ import annotations
 
+import csv
 import datetime as dt
 import json
 import sqlite3
@@ -28,6 +31,7 @@ CREATE TABLE IF NOT EXISTS posts (
     analysis          TEXT,               -- JSON from the drafter
     draft             TEXT,               -- reply Claude suggested
     final_comment     TEXT,               -- reply you approved (maybe edited)
+    approved_by       TEXT,               -- auto | review | edited
     error             TEXT,
     posted_at         TEXT
 );
@@ -51,6 +55,15 @@ class Store:
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after a database was first created."""
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(posts)")}
+        if "approved_by" not in columns:
+            self.db.execute("ALTER TABLE posts ADD COLUMN approved_by TEXT")
+        self.db.execute("UPDATE posts SET status = 'unverified' WHERE status = 'failed' AND posted_at IS NOT NULL")
+        self.db.commit()
 
     def close(self) -> None:
         self.db.close()
@@ -133,9 +146,10 @@ class Store:
             "SELECT * FROM posts WHERE status = ? ORDER BY first_seen", (status,)
         ).fetchall()
 
-    def approve(self, post_id: str, comment: str) -> None:
+    def approve(self, post_id: str, comment: str, by: str = "review") -> None:
         self.db.execute(
-            "UPDATE posts SET status = 'approved', final_comment = ? WHERE post_id = ?", (comment, post_id)
+            "UPDATE posts SET status = 'approved', final_comment = ?, approved_by = ? WHERE post_id = ?",
+            (comment, by, post_id),
         )
         self.db.commit()
 
@@ -150,11 +164,42 @@ class Store:
         self.db.commit()
 
     def mark_unverified(self, post_id: str, error: str) -> None:
-        """Comment was submitted but not seen on the page: failed, yet it counts toward the daily cap."""
+        """Comment was submitted but not seen on the page. It is in the history and counts toward the daily cap."""
         self.db.execute(
-            "UPDATE posts SET status = 'failed', posted_at = ?, error = ? WHERE post_id = ?", (_now(), error, post_id)
+            "UPDATE posts SET status = 'unverified', posted_at = ?, error = ? WHERE post_id = ?",
+            (_now(), error, post_id),
         )
         self.db.commit()
+
+    # ---- history --------------------------------------------------------
+
+    def history(self, limit: int | None = None) -> list[sqlite3.Row]:
+        """Posts the bot commented on, newest first."""
+        sql = "SELECT * FROM posts WHERE posted_at IS NOT NULL ORDER BY posted_at DESC"
+        if limit:
+            sql += f" LIMIT {int(limit)}"
+        return self.db.execute(sql).fetchall()
+
+    def export_history(self, path) -> int:
+        """Write the full comment history to a CSV file (opens in Excel or Numbers). Returns row count."""
+        rows = self.history()
+        with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+            writer = csv.writer(fh)
+            writer.writerow([
+                "commented_at", "status", "group", "post_url", "author", "post_written_at",
+                "post_text", "questions", "travel_dates", "draft", "comment", "approved_by",
+            ])
+            for r in rows:
+                analysis = json.loads(r["analysis"]) if r["analysis"] else {}
+                written = (
+                    dt.datetime.fromtimestamp(r["created_at"]).isoformat(timespec="minutes") if r["created_at"] else ""
+                )
+                writer.writerow([
+                    r["posted_at"], r["status"], r["group_url"], r["url"], r["author_name"] or "", written,
+                    r["text"] or "", "; ".join(analysis.get("questions") or []), analysis.get("travel_dates") or "",
+                    r["draft"] or "", r["final_comment"] or "", r["approved_by"] or "",
+                ])
+        return len(rows)
 
     def posted_today(self) -> int:
         """Comments submitted today, including ones Facebook may have taken but we could not verify."""

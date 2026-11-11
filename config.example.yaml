@@ -32,6 +32,17 @@ post:
   comment_box_labels: []   # extra words from your Facebook language's comment box label
 
 llm:
-  model: claude-opus-5-5
-  effort: low              # low is enough for short replies; medium for trickier questions
+  # Qwen through any OpenAI-compatible API. Default: Alibaba Cloud Model Studio (DashScope).
+  provider: qwen
+  model: qwen-plus
+  base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1   # Singapore region
+  #   US (Virginia):       https://dashscope-us.aliyuncs.com/compatible-mode/v1
+  #   China (Beijing):     https://dashscope.aliyuncs.com/compatible-mode/v1
+  #   Local Ollama (free): http://localhost:11434/v1   with model: qwen3:8b  and extra_body: {}
+  #   OpenRouter:          https://openrouter.ai/api/v1  with api_key_env: OPENROUTER_API_KEY, extra_body: {}
+  api_key_env: DASHSCOPE_API_KEY   # name of the variable in .env that holds the key
+  extra_body:
+    enable_thinking: false         # Alibaba Cloud only: JSON output needs thinking off
   max_reply_words: 40
+
+  # To use Claude instead: provider: claude, model: claude-opus-5-5, effort: low (key: ANTHROPIC_API_KEY)

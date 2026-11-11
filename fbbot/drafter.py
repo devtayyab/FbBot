@@ -1,24 +1,43 @@
-"""Use Claude to decide whether a post needs a reply, and draft a short one."""
+"""Decide whether a post needs a reply, and draft a short one.
+
+Two model backends, picked with llm.provider in config.yaml:
+  qwen    any OpenAI-compatible API serving Qwen: Alibaba Cloud Model Studio
+          (DashScope, the default), a local Ollama, OpenRouter, ...
+  claude  Anthropic's Claude API
+"""
 from __future__ import annotations
 
 import datetime as dt
+import json
+import os
 import re
 from typing import Literal
 
-import anthropic
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError, field_validator
 
 from .config import load_knowledge
+
+DEFAULT_MODELS = {"qwen": "qwen-plus", "claude": "claude-opus-5-5"}
 
 
 class Analysis(BaseModel):
     relevant: bool
-    is_visitor: bool
-    questions: list[str]
-    travel_dates: str
-    reply: str
-    confidence: Literal["high", "medium", "low"]
-    skip_reason: str
+    is_visitor: bool = False
+    questions: list[str] = []
+    travel_dates: str = ""
+    reply: str = ""
+    confidence: Literal["high", "medium", "low"] = "low"
+    skip_reason: str = ""
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _lower(cls, value):
+        return str(value).strip().lower() if value is not None else "low"
+
+    @field_validator("travel_dates", "reply", "skip_reason", mode="before")
+    @classmethod
+    def _none_to_empty(cls, value):
+        return "" if value is None else value
 
 
 SCHEMA = {
@@ -48,7 +67,7 @@ SCHEMA = {
 }
 
 SYSTEM_TEMPLATE = """You help a member of a Facebook travel group reply to posts from people visiting {destination}.
-You write as {persona}. The account owner reads every reply before it is posted under their own name.
+You write as {persona}. The comment is posted under the account owner's own name.
 
 For each post, decide:
 - relevant: true if the author is planning a trip to or within {destination}, or asks something a local can usefully answer. False for ads, selling, job offers, memes, lost and found, politics, trip reports with no question, or anything you cannot answer well.
@@ -73,26 +92,107 @@ Local notes from the account owner (trusted facts):
 {knowledge}
 </notes>"""
 
+JSON_FORMAT = """
+
+Answer with one JSON object only, no other text, with exactly these keys:
+{"relevant": boolean, "is_visitor": boolean, "questions": [string], "travel_dates": string,
+ "reply": string, "confidence": "high" | "medium" | "low", "skip_reason": string}"""
+
 
 class Drafter:
     def __init__(self, cfg: dict):
         llm = cfg["llm"]
-        self.model = llm["model"]
-        self.effort = llm["effort"]
-        self.max_words = int(llm["max_reply_words"])
-        self.system = SYSTEM_TEMPLATE.format(
+        provider = (llm.get("provider") or "qwen").lower()
+        model = llm.get("model") or DEFAULT_MODELS.get(provider, "")
+        system = SYSTEM_TEMPLATE.format(
             destination=cfg["destination"],
             persona=cfg["persona"],
-            max_words=self.max_words,
+            max_words=int(llm["max_reply_words"]),
             knowledge=load_knowledge(),
         )
-        self.client = anthropic.Anthropic()
+        if provider == "claude":
+            self._backend = _ClaudeBackend(model, llm, system)
+        elif provider == "qwen":
+            self._backend = _QwenBackend(model, llm, system + JSON_FORMAT)
+        else:
+            raise SystemExit(f"llm.provider must be qwen or claude, not {provider!r}")
+        # Errors that mean the setup is wrong (key, model name): every post would fail the same way.
+        self.setup_errors: tuple[type[Exception], ...] = self._backend.setup_errors
 
     def analyze(self, text: str, first_time_poster: bool = False) -> Analysis | None:
-        """Return the analysis, or None if Claude declined to answer."""
+        """Return the analysis, or None if the model declined to answer."""
         intro = "New post in the group" + (" from someone posting for the first time" if first_time_poster else "")
         user = f"Today is {dt.date.today():%A, %d %B %Y}. {intro}:\n<post>\n{text}\n</post>"
 
+        last_error: Exception | None = None
+        for _ in range(2):  # one retry if the model returns malformed JSON
+            raw = self._backend.complete(user)
+            if raw is None:
+                return None
+            try:
+                analysis = Analysis.model_validate_json(_extract_json(raw))
+                break
+            except (ValidationError, ValueError) as exc:
+                last_error = exc
+        else:
+            raise RuntimeError(f"model did not return valid JSON: {last_error}")
+
+        analysis.reply = _clean(analysis.reply)
+        if analysis.relevant and not analysis.reply:
+            analysis.relevant = False
+            analysis.skip_reason = analysis.skip_reason or "no reply drafted"
+        return analysis
+
+
+class _QwenBackend:
+    """Qwen through an OpenAI-compatible chat completions API."""
+
+    def __init__(self, model: str, llm: dict, system: str):
+        import openai
+
+        base_url = llm["base_url"]
+        key_env = llm["api_key_env"]
+        api_key = os.environ.get(key_env) or ""
+        if not api_key:
+            if "localhost" in base_url or "127.0.0.1" in base_url:
+                api_key = "local"  # Ollama and similar ignore the key
+            else:
+                raise SystemExit(f"Set {key_env} in .env (your Qwen API key).")
+        self.client = openai.OpenAI(base_url=base_url, api_key=api_key, timeout=120)
+        self.model = model
+        self.system = system
+        self.extra_body = llm.get("extra_body") or None
+        self.setup_errors = (openai.AuthenticationError, openai.PermissionDeniedError, openai.NotFoundError)
+
+    def complete(self, user: str) -> str | None:
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "system", "content": self.system}, {"role": "user", "content": user}],
+            response_format={"type": "json_object"},
+            max_tokens=800,
+            extra_body=self.extra_body,  # e.g. {"enable_thinking": false} for Alibaba Cloud
+        )
+        choice = response.choices[0]
+        if choice.finish_reason == "content_filter":
+            return None
+        if choice.finish_reason == "length":
+            raise RuntimeError("Qwen ran out of tokens while drafting")
+        return choice.message.content or ""
+
+
+class _ClaudeBackend:
+    """Claude through the Anthropic SDK, with structured outputs."""
+
+    def __init__(self, model: str, llm: dict, system: str):
+        import anthropic
+
+        self.client = anthropic.Anthropic()
+        self.model = model
+        self.effort = llm.get("effort") or "low"
+        self.system = system
+        self.setup_errors = (anthropic.AuthenticationError, anthropic.PermissionDeniedError, anthropic.NotFoundError)
+
+    def complete(self, user: str) -> str | None:
         response = self.client.beta.messages.create(
             model=self.model,
             max_tokens=4_000,
@@ -108,8 +208,7 @@ class Drafter:
         if response.stop_reason == "refusal":
             return None
         if response.stop_reason == "max_tokens":
-            raise RuntimeError("Claude ran out of tokens while drafting; raise max_tokens in drafter.py")
-
+            raise RuntimeError("Claude ran out of tokens while drafting")
         # Use the text written after the last model switch, if a fallback ran.
         chunks: list[str] = []
         for block in response.content:
@@ -117,12 +216,18 @@ class Drafter:
                 chunks = []
             elif block.type == "text":
                 chunks.append(block.text)
-        analysis = Analysis.model_validate_json("".join(chunks))
-        analysis.reply = _clean(analysis.reply)
-        if analysis.relevant and not analysis.reply:
-            analysis.relevant = False
-            analysis.skip_reason = analysis.skip_reason or "no reply drafted"
-        return analysis
+        return "".join(chunks)
+
+
+def _extract_json(raw: str) -> str:
+    """Strip <think> blocks and code fences some Qwen setups add, keep the JSON object."""
+    raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.S).strip()
+    start, end = raw.find("{"), raw.rfind("}")
+    if start == -1 or end <= start:
+        raise ValueError("no JSON object in model output")
+    candidate = raw[start:end + 1]
+    json.loads(candidate)  # raises ValueError if broken
+    return candidate
 
 
 def _clean(reply: str) -> str:

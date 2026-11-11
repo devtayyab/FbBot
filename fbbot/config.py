@@ -37,11 +37,16 @@ DEFAULTS: dict = {
         "comment_box_labels": [],
     },
     "llm": {
-        "model": "claude-opus-5-5",
-        "effort": "low",
+        "provider": "qwen",  # qwen | claude
+        "model": "",  # empty = qwen-plus for qwen, claude-opus-5-5 for claude
+        "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",  # qwen only
+        "api_key_env": "DASHSCOPE_API_KEY",  # qwen only; claude reads ANTHROPIC_API_KEY
+        "extra_body": {},  # qwen only; config.example.yaml sets enable_thinking: false for Alibaba Cloud
+        "effort": "low",  # claude only
         "max_reply_words": 40,
     },
 }
+HISTORY_CSV = DATA / "comment_history.csv"
 
 
 def _merge(base: dict, override: dict) -> dict:
