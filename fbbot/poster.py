@@ -21,6 +21,10 @@ class PostError(RuntimeError):
     pass
 
 
+class PostUnverified(PostError):
+    """Enter was pressed and the box cleared, but the comment is not visible; it may be live."""
+
+
 def _label(box: Locator) -> str:
     return " ".join(
         filter(None, [box.get_attribute("aria-label"), box.get_attribute("aria-placeholder")])
@@ -41,8 +45,24 @@ def _find_comment_box(page: Page, pattern: re.Pattern) -> Locator | None:
     return None
 
 
+def _find_comment_button(page: Page, pattern: re.Pattern) -> Locator | None:
+    """The "Comment" action button, not the "12 comments" counter or a chat button."""
+    buttons = page.get_by_role("button", name=pattern)
+    for i in range(min(buttons.count(), 15)):
+        button = buttons.nth(i)
+        if not button.is_visible():
+            continue
+        name = (button.get_attribute("aria-label") or button.inner_text() or "").strip()
+        if re.search(r"\d", name) or BLOCK_WORDS.search(name):
+            continue
+        return button
+    return None
+
+
 def post_comment(ctx: BrowserContext, url: str, text: str, extra_labels: list[str], dry_run: bool = False) -> None:
-    pattern = re.compile("|".join(re.escape(w) for w in COMMENT_WORDS + list(extra_labels)), re.I)
+    # Drop blank labels: an empty alternative would match every text box on the page.
+    words = [w.strip() for w in COMMENT_WORDS + list(extra_labels or []) if w and w.strip()]
+    pattern = re.compile("|".join(re.escape(w) for w in words), re.I)
     page = ctx.new_page()
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=60_000)
@@ -52,8 +72,8 @@ def post_comment(ctx: BrowserContext, url: str, text: str, extra_labels: list[st
         box = _find_comment_box(page, pattern)
         if box is None:
             # Some layouts only show the box after pressing the "Comment" button.
-            button = page.get_by_role("button", name=pattern).first
-            if button.count():
+            button = _find_comment_button(page, pattern)
+            if button is not None:
                 button.click()
                 page.wait_for_timeout(2_000)
                 box = _find_comment_box(page, pattern)
@@ -74,6 +94,6 @@ def post_comment(ctx: BrowserContext, url: str, text: str, extra_labels: list[st
             raise PostError("comment text is still in the box; Facebook did not accept it")
         snippet = text[:40]
         if not page.get_by_text(snippet, exact=False).count():
-            raise PostError("submitted, but the comment is not visible on the page; check the post by hand")
+            raise PostUnverified("submitted, but the comment is not visible on the page; check the post by hand")
     finally:
         page.close()

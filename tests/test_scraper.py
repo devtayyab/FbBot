@@ -43,6 +43,25 @@ class ExtractTest(unittest.TestCase):
         story = {"__typename": "Story", "url": "https://www.facebook.com/groups/123/permalink/555/"}
         self.assertIn("555", extract_posts(story))
 
+    def test_shared_post_does_not_borrow_attached_story_fields(self):
+        story = {
+            "__typename": "Story",
+            "post_id": "222",
+            "url": "https://www.facebook.com/groups/travelgroup/posts/222/",
+            "attached_story": {
+                "__typename": "Story",
+                "post_id": "999",
+                "url": "https://www.facebook.com/groups/othergroup/posts/999/",
+                "message": {"text": "the original shared post"},
+                "creation_time": 1500000000,
+            },
+            "comet_sections": {"metadata": [{"story": {"creation_time": 1762862400}}]},
+        }
+        posts = extract_posts(story)
+        self.assertEqual(list(posts), ["222"])
+        self.assertIsNone(posts["222"].get("text"))
+        self.assertEqual(posts["222"]["created_at"], 1762862400)
+
     def test_parse_blob_handles_prefix_and_multiple_docs(self):
         blob = "for (;;);" + json.dumps({"a": 1}) + "\n" + json.dumps({"b": 2}) + "\nnot json"
         self.assertEqual(parse_blob(blob), [{"a": 1}, {"b": 2}])

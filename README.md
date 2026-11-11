@@ -70,6 +70,8 @@ Option B, terminal: `.venv/bin/python bot.py loop` (Ctrl+C stops it).
 - **launchd cannot read ~/Documents.** macOS may block background jobs in Documents. Either give `/bin/zsh` Full Disk Access (System Settings > Privacy & Security), move the folder, or use `bot.py loop`.
 - **Run one command at a time.** Chrome locks the bot profile, so a second command fails while the first one is running.
 - **Photos are not read.** Photo-only posts are skipped. Text with a photo is answered from the text alone.
+- **"First-time poster" means new to the bot.** The first scan records everyone already posting, so nobody is flagged on that run. After that, an author is flagged the first time the bot sees them post. Facebook does not show the bot when someone joined the group.
+- **Drafting errors.** If Claude fails on a post (network or rate limit), the post is retried on the next scan. A wrong API key or model name stops the scan with one clear message.
 
 ## Links
 - Code: `fbbot/` (`scraper.py` reads posts, `drafter.py` holds the Claude prompt, `poster.py` posts comments, `cli.py` holds the commands)

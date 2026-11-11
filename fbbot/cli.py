@@ -47,17 +47,19 @@ def cmd_login(cfg: dict, args) -> None:
 # ---- scan -----------------------------------------------------------------
 
 def cmd_scan(cfg: dict, args) -> None:
+    import anthropic
+
     from .drafter import Drafter  # imported here so `login` works without an API key
     from .scraper import scrape_group
 
-    store = Store()
     drafter = Drafter(cfg)
     max_age = dt.timedelta(hours=cfg["scan"]["max_post_age_hours"])
     auto = cfg["post"]["auto_post"]
     min_rank = CONFIDENCE_RANK[cfg["post"]["auto_post_min_confidence"]]
-    new_count = drafted = auto_approved = 0
+    new_count = drafted = auto_approved = draft_errors = 0
 
-    with _browser(cfg) as ctx:
+    with Store() as store, _browser(cfg) as ctx:
+        baseline = store.is_empty()
         for group_url in cfg["groups"]:
             print(f"Scanning {group_url}")
             posts = scrape_group(ctx, group_url, cfg["scan"]["scrolls"], debug=args.debug)
@@ -68,14 +70,24 @@ def cmd_scan(cfg: dict, args) -> None:
                 new_count += 1
                 created = post.get("created_at")
                 if created and dt.datetime.now() - dt.datetime.fromtimestamp(created) > max_age:
-                    store.add_post(post, group_url, "ignored", "older than max_post_age_hours")
+                    store.add_post(post, group_url, "ignored", "older than max_post_age_hours", baseline=baseline)
                     continue
                 if not post.get("text"):
-                    store.add_post(post, group_url, "ignored", "no text (photo or link only)")
+                    store.add_post(post, group_url, "ignored", "no text (photo or link only)", baseline=baseline)
                     continue
 
-                first_time = store.add_post(post, group_url, "new")
-                analysis = drafter.analyze(post["text"], first_time_poster=first_time)
+                first_time = store.add_post(post, group_url, "new", baseline=baseline)
+                try:
+                    analysis = drafter.analyze(post["text"], first_time_poster=first_time)
+                except Exception as exc:  # API or parse error: retry this post next scan
+                    store.discard_post(post["post_id"])
+                    if isinstance(exc, (anthropic.AuthenticationError, anthropic.PermissionDeniedError,
+                                        anthropic.NotFoundError)):
+                        # Every post would fail the same way: stop instead of trying each one.
+                        raise SystemExit(f"Claude API setup problem (check .env key and llm.model): {exc}")
+                    draft_errors += 1
+                    print(f"  drafting failed, will retry next scan: {exc!r}")
+                    continue
                 if analysis is None:
                     store.set_status(post["post_id"], "ignored", "Claude declined to draft")
                     continue
@@ -91,9 +103,11 @@ def cmd_scan(cfg: dict, args) -> None:
                 tag = " [first-time poster]" if first_time else ""
                 print(f"  + {post.get('author_name') or '?'}{tag}: {analysis.reply}")
 
-    pending = len(store.by_status("pending"))
-    store.close()
-    print(f"New posts: {new_count}, replies drafted: {drafted}, auto-approved: {auto_approved}, waiting for review: {pending}")
+        pending = len(store.by_status("pending"))
+    print(
+        f"New posts: {new_count}, replies drafted: {drafted}, auto-approved: {auto_approved}, "
+        f"drafting errors: {draft_errors}, waiting for review: {pending}"
+    )
     if pending:
         _notify(f"{pending} draft replies waiting: python bot.py review")
 
@@ -101,7 +115,11 @@ def cmd_scan(cfg: dict, args) -> None:
 # ---- review ---------------------------------------------------------------
 
 def cmd_review(cfg: dict, args) -> None:
-    store = Store()
+    with Store() as store:
+        _review(store)
+
+
+def _review(store: Store) -> None:
     pending = store.by_status("pending")
     if not pending:
         print("Nothing to review.")
@@ -129,19 +147,21 @@ def cmd_review(cfg: dict, args) -> None:
             elif choice == "o":
                 webbrowser.open(row["url"])
             elif choice == "q":
-                store.close()
                 return
-    store.close()
     print("Done. Approved comments go out with: python bot.py post")
 
 
 # ---- post -----------------------------------------------------------------
 
 def cmd_post(cfg: dict, args) -> None:
-    from .poster import PostError, post_comment
+    with Store() as store:
+        _post(cfg, args, store)
+
+
+def _post(cfg: dict, args, store: Store) -> None:
+    from .poster import PostError, PostUnverified, post_comment
 
     pc = cfg["post"]
-    store = Store()
     approved = store.by_status("approved")
     room_today = pc["max_per_day"] - store.posted_today()
     batch = approved[: max(0, min(pc["max_per_run"], room_today))]
@@ -161,14 +181,18 @@ def cmd_post(cfg: dict, args) -> None:
             print(f"Commenting on {row['url']}\n  {row['final_comment']}")
             try:
                 post_comment(ctx, row["url"], row["final_comment"], pc["comment_box_labels"], dry_run=args.dry_run)
+            except PostUnverified as exc:
+                store.mark_unverified(row["post_id"], str(exc))  # counts toward max_per_day
+                print(f"  failed: {exc}")
+                continue
             except PostError as exc:
-                store.set_status(row["post_id"], "failed", str(exc))
+                if not args.dry_run:  # a dry run must not change the queue
+                    store.set_status(row["post_id"], "failed", str(exc))
                 print(f"  failed: {exc}")
                 continue
             if not args.dry_run:
                 store.mark_posted(row["post_id"])
                 print("  posted")
-    store.close()
 
 
 # ---- run / loop / status / try ---------------------------------------------
@@ -194,13 +218,12 @@ def cmd_loop(cfg: dict, args) -> None:
 
 
 def cmd_status(cfg: dict, args) -> None:
-    store = Store()
-    counts = store.counts()
-    print("Posts by status:", counts or "none yet")
-    print("Posted today:", store.posted_today())
-    for row in store.by_status("failed")[-5:]:
-        print(f"  failed: {row['url']} -> {row['error']}")
-    store.close()
+    with Store() as store:
+        counts = store.counts()
+        print("Posts by status:", counts or "none yet")
+        print("Posted today:", store.posted_today())
+        for row in store.by_status("failed")[-5:]:
+            print(f"  failed: {row['url']} -> {row['error']}")
 
 
 def cmd_try(cfg: dict, args) -> None:
@@ -232,8 +255,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("text")
 
     args = parser.parse_args(argv)
-    needs_groups = args.command in ("scan", "run", "loop", "try")
-    cfg = load_config(require_groups=needs_groups)
+    needs_groups = args.command in ("scan", "run", "loop")
+    needs_destination = needs_groups or args.command == "try"
+    cfg = load_config(require_groups=needs_groups, require_destination=needs_destination)
     handler = globals()[f"cmd_{args.command}"]
     try:
         handler(cfg, args)

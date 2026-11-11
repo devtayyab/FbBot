@@ -21,6 +21,9 @@ from .browser import ensure_logged_in
 from .config import DEBUG_DIR
 
 POST_URL_RE = re.compile(r"/groups/([^/?#]+)/(?:posts|permalink)/(\d+)")
+# A shared post nests the original post here. Its text, time and author are not the
+# sharer's, and it may belong to another group, so the parser never looks inside it.
+SKIP_KEYS = frozenset({"attached_story"})
 
 
 # ---- JSON helpers ---------------------------------------------------------
@@ -53,7 +56,7 @@ def _walk(obj):
         cur = stack.pop()
         if isinstance(cur, dict):
             yield cur
-            stack.extend(cur.values())
+            stack.extend(v for k, v in cur.items() if k not in SKIP_KEYS)
         elif isinstance(cur, list):
             stack.extend(cur)
 
@@ -67,7 +70,7 @@ def _nearest(obj, pick):
             found = pick(cur)
             if found is not None:
                 return found
-            queue.extend(cur.values())
+            queue.extend(v for k, v in cur.items() if k not in SKIP_KEYS)
         elif isinstance(cur, list):
             queue.extend(cur)
     return None

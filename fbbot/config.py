@@ -69,19 +69,26 @@ def load_env() -> None:
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
-def load_config(require_groups: bool = True) -> dict:
+def load_config(require_groups: bool = True, require_destination: bool | None = None) -> dict:
     load_env()
     if not CONFIG_PATH.exists():
         raise SystemExit(
             "config.yaml is missing. Run: cp config.example.yaml config.yaml, then fill in your group URL."
         )
     cfg = _merge(DEFAULTS, yaml.safe_load(CONFIG_PATH.read_text()) or {})
+    if require_destination is None:
+        require_destination = require_groups
     if require_groups:
         groups = cfg.get("groups") or []
-        if not groups or any("YOUR_GROUP" in g for g in groups):
+        if not groups or any(not isinstance(g, str) or "YOUR_GROUP" in g for g in groups):
             raise SystemExit("Set at least one real group URL under 'groups' in config.yaml.")
+    if require_destination:
         if not cfg.get("destination") or "YOUR_CITY" in cfg["destination"]:
             raise SystemExit("Set 'destination' in config.yaml (the place visitors are coming to).")
+    confidence = str(cfg["post"]["auto_post_min_confidence"]).strip().lower()
+    if confidence not in ("high", "medium", "low"):
+        raise SystemExit("post.auto_post_min_confidence in config.yaml must be high, medium or low.")
+    cfg["post"]["auto_post_min_confidence"] = confidence
     for path in (DATA, DEBUG_DIR, LOG_DIR):
         path.mkdir(parents=True, exist_ok=True)
     return cfg
