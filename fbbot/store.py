@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS posts (
     draft             TEXT,               -- reply Claude suggested
     final_comment     TEXT,               -- reply you approved (maybe edited)
     approved_by       TEXT,               -- auto | review | edited
+    primary_agent_id  TEXT,               -- agent that posted the primary comment
     error             TEXT,
     posted_at         TEXT
 );
@@ -43,6 +44,28 @@ CREATE TABLE IF NOT EXISTS authors (
     first_seen TEXT NOT NULL,
     post_count INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS agent_actions (
+    action_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    post_id             TEXT NOT NULL,
+    agent_id            TEXT NOT NULL,
+    action_type         TEXT NOT NULL, -- 'comment', 'reply', 'like', 'skip'
+    target_agent_id     TEXT,          -- agent being replied to or liked
+    target_comment_text TEXT,          -- parent comment text snippet
+    content             TEXT,          -- text to post (empty for 'like' or 'skip')
+    confidence          TEXT,          -- 'high', 'medium', 'low'
+    analysis            TEXT,          -- JSON details
+    status              TEXT NOT NULL, -- 'pending', 'approved', 'posted', 'unverified', 'failed', 'skipped'
+    approved_by         TEXT,          -- 'auto', 'review', 'edited'
+    error               TEXT,
+    scheduled_after     TEXT,          -- ISO timestamp when this action can execute
+    created_at          TEXT NOT NULL,
+    executed_at         TEXT,
+    FOREIGN KEY (post_id) REFERENCES posts(post_id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_actions_post ON agent_actions(post_id);
+CREATE INDEX IF NOT EXISTS idx_agent_actions_agent ON agent_actions(agent_id);
+CREATE INDEX IF NOT EXISTS idx_agent_actions_status ON agent_actions(status);
 """
 
 
@@ -58,10 +81,12 @@ class Store:
         self._migrate()
 
     def _migrate(self) -> None:
-        """Add columns introduced after a database was first created."""
+        """Add columns and tables introduced after a database was first created."""
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(posts)")}
         if "approved_by" not in columns:
             self.db.execute("ALTER TABLE posts ADD COLUMN approved_by TEXT")
+        if "primary_agent_id" not in columns:
+            self.db.execute("ALTER TABLE posts ADD COLUMN primary_agent_id TEXT")
         self.db.execute("UPDATE posts SET status = 'unverified' WHERE status = 'failed' AND posted_at IS NOT NULL")
         self.db.commit()
 
@@ -212,3 +237,139 @@ class Store:
     def counts(self) -> dict[str, int]:
         rows = self.db.execute("SELECT status, COUNT(*) FROM posts GROUP BY status").fetchall()
         return {r[0]: r[1] for r in rows}
+
+    # ---- multi-agent coordination actions -------------------------------
+
+    def add_action(
+        self,
+        post_id: str,
+        agent_id: str,
+        action_type: str,
+        content: str = "",
+        target_agent_id: str | None = None,
+        target_comment_text: str | None = None,
+        confidence: str = "medium",
+        analysis: dict | None = None,
+        status: str = "pending",
+        approved_by: str | None = None,
+        scheduled_after: str | None = None,
+    ) -> int:
+        cur = self.db.execute(
+            """INSERT INTO agent_actions (
+                   post_id, agent_id, action_type, target_agent_id, target_comment_text,
+                   content, confidence, analysis, status, approved_by, scheduled_after, created_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                post_id, agent_id, action_type, target_agent_id, target_comment_text,
+                content, confidence, json.dumps(analysis, ensure_ascii=False) if analysis else None,
+                status, approved_by, scheduled_after, _now(),
+            ),
+        )
+        self.db.commit()
+        return cur.lastrowid
+
+    def get_post_actions(self, post_id: str) -> list[sqlite3.Row]:
+        return self.db.execute(
+            "SELECT * FROM agent_actions WHERE post_id = ? ORDER BY action_id", (post_id,)
+        ).fetchall()
+
+    def has_agent_acted(self, post_id: str, agent_id: str) -> bool:
+        row = self.db.execute(
+            "SELECT 1 FROM agent_actions WHERE post_id = ? AND agent_id = ? LIMIT 1",
+            (post_id, agent_id),
+        ).fetchone()
+        return row is not None
+
+    def get_primary_comment(self, post_id: str) -> dict | None:
+        """Find the primary top-level comment made on this post by our agents."""
+        # 1. Check agent_actions
+        row = self.db.execute(
+            """SELECT * FROM agent_actions
+               WHERE post_id = ? AND action_type = 'comment' AND status IN ('posted', 'approved', 'unverified')
+               ORDER BY action_id LIMIT 1""",
+            (post_id,),
+        ).fetchone()
+        if row:
+            return {
+                "agent_id": row["agent_id"],
+                "content": row["content"],
+                "status": row["status"],
+                "executed_at": row["executed_at"],
+            }
+        # 2. Check posts table for legacy / default agent comment
+        p = self.db.execute("SELECT * FROM posts WHERE post_id = ?", (post_id,)).fetchone()
+        if p and (p["final_comment"] or p["draft"]) and p["status"] in ("posted", "approved", "unverified"):
+            return {
+                "agent_id": p["primary_agent_id"] or "default",
+                "content": p["final_comment"] or p["draft"],
+                "status": p["status"],
+                "executed_at": p["posted_at"],
+            }
+        return None
+
+    def pending_actions(self, agent_id: str | None = None) -> list[sqlite3.Row]:
+        sql = """SELECT a.*, p.url, p.text as post_text, p.author_name as post_author
+                 FROM agent_actions a
+                 JOIN posts p ON a.post_id = p.post_id
+                 WHERE a.status = 'pending'"""
+        params = []
+        if agent_id:
+            sql += " AND a.agent_id = ?"
+            params.append(agent_id)
+        sql += " ORDER BY a.action_id"
+        return self.db.execute(sql, params).fetchall()
+
+    def due_actions(self, agent_id: str | None = None) -> list[sqlite3.Row]:
+        """Approved actions whose scheduled time has arrived."""
+        now = _now()
+        sql = """SELECT a.*, p.url, p.text as post_text, p.author_name as post_author
+                 FROM agent_actions a
+                 JOIN posts p ON a.post_id = p.post_id
+                 WHERE a.status = 'approved'
+                   AND (a.scheduled_after IS NULL OR a.scheduled_after <= ?)"""
+        params = [now]
+        if agent_id:
+            sql += " AND a.agent_id = ?"
+            params.append(agent_id)
+        sql += " ORDER BY a.action_id"
+        return self.db.execute(sql, params).fetchall()
+
+    def approve_action(self, action_id: int, content: str | None = None, by: str = "review") -> None:
+        if content is not None:
+            self.db.execute(
+                "UPDATE agent_actions SET status = 'approved', content = ?, approved_by = ? WHERE action_id = ?",
+                (content, by, action_id),
+            )
+        else:
+            self.db.execute(
+                "UPDATE agent_actions SET status = 'approved', approved_by = ? WHERE action_id = ?",
+                (by, action_id),
+            )
+        self.db.commit()
+
+    def set_action_status(self, action_id: int, status: str, error: str | None = None) -> None:
+        self.db.execute(
+            "UPDATE agent_actions SET status = ?, error = ? WHERE action_id = ?",
+            (status, error, action_id),
+        )
+        self.db.commit()
+
+    def mark_action_executed(self, action_id: int, unverified_error: str | None = None) -> None:
+        now = _now()
+        status = "unverified" if unverified_error else "posted"
+        self.db.execute(
+            "UPDATE agent_actions SET status = ?, error = ?, executed_at = ? WHERE action_id = ?",
+            (status, unverified_error, now, action_id),
+        )
+        self.db.commit()
+
+    def posted_today_by_agent(self, agent_id: str) -> int:
+        today = dt.date.today().isoformat()
+        row = self.db.execute(
+            """SELECT COUNT(*) FROM agent_actions
+               WHERE agent_id = ? AND executed_at IS NOT NULL
+                 AND action_type IN ('comment', 'reply')
+                 AND substr(executed_at, 1, 10) = ?""",
+            (agent_id, today),
+        ).fetchone()
+        return row[0] if row else 0

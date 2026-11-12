@@ -9,7 +9,8 @@ import yaml
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
-PROFILE_DIR = DATA / "fb_profile"  # logged-in browser profile (keep private)
+PROFILE_DIR = DATA / "fb_profile"  # legacy single-account profile
+PROFILES_DIR = DATA / "profiles"   # multi-agent profiles: data/profiles/<agent_id>/
 DB_PATH = DATA / "bot.db"
 DEBUG_DIR = DATA / "debug"
 LOG_DIR = DATA / "logs"
@@ -99,8 +100,64 @@ def load_config(require_groups: bool = True, require_destination: bool | None = 
     return cfg
 
 
-def load_knowledge() -> str:
-    if not KNOWLEDGE_PATH.exists():
+def get_profile_dir(agent_id: str | None = None) -> pathlib.Path:
+    """Return the profile directory for a specific agent or default."""
+    if not agent_id or agent_id == "default":
+        # Check if legacy single profile exists first, else use profiles/default
+        if PROFILE_DIR.exists() and not (PROFILES_DIR / "default").exists():
+            return PROFILE_DIR
+        return PROFILES_DIR / "default"
+    return PROFILES_DIR / agent_id
+
+
+def get_agents(cfg: dict) -> dict[str, dict]:
+    """Return the mapping of agent_id -> agent configuration dict.
+    
+    If 'agents' is defined in config.yaml, returns all configured agents.
+    Otherwise returns a single {'default': <root_config>} agent for full backward compatibility.
+    """
+    configured_agents = cfg.get("agents")
+    if isinstance(configured_agents, dict) and configured_agents:
+        result = {}
+        for agent_id, agent_cfg in configured_agents.items():
+            result[agent_id] = get_agent_config(cfg, agent_id)
+        return result
+    return {"default": get_agent_config(cfg, "default")}
+
+
+def get_agent_config(cfg: dict, agent_id: str) -> dict:
+    """Merge agent-specific settings with global configuration."""
+    base = copy.deepcopy(cfg)
+    agent_overrides = (cfg.get("agents") or {}).get(agent_id, {})
+    
+    agent_merged = {
+        "agent_id": agent_id,
+        "name": agent_overrides.get("name", agent_id),
+        "persona": agent_overrides.get("persona", base.get("persona")),
+        "destination": base.get("destination", ""),
+        "groups": base.get("groups", []),
+        "browser_channel": agent_overrides.get("browser_channel", base.get("browser_channel", "chrome")),
+        "knowledge_file": agent_overrides.get("knowledge_file", "knowledge.md"),
+        "scan": _merge(base.get("scan", {}), agent_overrides.get("scan", {})),
+        "post": _merge(base.get("post", {}), agent_overrides.get("post", {})),
+        "llm": _merge(base.get("llm", {}), agent_overrides.get("llm", {})),
+        "collaboration": _merge({
+            "min_delay_after_primary_mins": 15,
+            "allow_like": True,
+            "allow_reply": True,
+        }, agent_overrides.get("collaboration", {})),
+    }
+    return agent_merged
+
+
+def load_knowledge(knowledge_file: str | pathlib.Path | None = None) -> str:
+    path = KNOWLEDGE_PATH
+    if knowledge_file:
+        p = pathlib.Path(knowledge_file)
+        path = p if p.is_absolute() else (ROOT / p)
+    if not path.exists():
+        if path != KNOWLEDGE_PATH and KNOWLEDGE_PATH.exists():
+            return KNOWLEDGE_PATH.read_text().strip() or "(no local notes yet)"
         return "(no local notes yet)"
-    text = KNOWLEDGE_PATH.read_text().strip()
+    text = path.read_text().strip()
     return text or "(no local notes yet)"

@@ -1,82 +1,149 @@
-# FB Bot: travel group helper
+# FB Bot: Multi-Agent Travel Helper & Swarm
 
 ## Purpose
-Every hour, the bot reads new posts in one or more Facebook travel groups, finds people who are visiting or asking travel questions, and comments a short, natural reply from your own Facebook account.
+The bot automates engagement in Facebook travel and community groups from real Facebook accounts.
 
-How one run works:
-1. **Scan.** Your Chrome opens the group sorted by "New posts" and scrolls. The bot reads the post data Facebook loads and skips posts it has already seen.
-2. **Draft.** The AI model (Qwen by default, or Claude) reads each new post. Ads, sales posts, posts older than 48 hours and photo-only posts are ignored. For the rest, it writes a reply of one or two sentences, in the post's language, using facts from `knowledge.md`.
-3. **Approve.** With `auto_post: false`, every draft waits for `python bot.py review`. With `auto_post: true`, drafts the model rates `high` confidence are approved on their own. Lower-confidence drafts still wait for review.
-4. **Post.** Approved comments are typed into the post's comment box, at most 5 per run and 15 per day, with a 90 to 240 second pause between them.
+It can operate in two modes:
+1. **Single-Agent Mode**: Reads posts in target groups, drafts helpful 1-2 sentence replies using local notes (`knowledge.md`), and posts comments after approval or auto-approval.
+2. **Multi-Agent Swarm Mode (Coordinated Team)**: Multiple agents/accounts collaborate organically on posts without spamming:
+   - **Primary Agent**: Detects new traveler inquiries and posts an authoritative, friendly answer.
+   - **Secondary Agent(s)**: Inspects the post and the primary agent's comment:
+     - **LIKE**: If the answer is already complete, the secondary agent Likes the comment to boost its algorithm ranking and social proof.
+     - **THREADED REPLY**: If the secondary agent can add a complementary tip (e.g. agreeing and adding a specific local recommendation), it posts a nested reply to the primary comment after a natural human delay (e.g. 15-30 minutes).
+     - **SKIP**: If the post is not relevant or already saturated, it skips to prevent unnecessary clutter.
 
-## Trigger
-- Hourly: macOS launchd (`scripts/com.fbbot.hourly.plist`) or `python bot.py loop` running in a terminal.
-- Manual: any command below.
+---
 
-## Steps
+## Architecture & Workflows
 
-### One-time setup
-```bash
-git clone https://github.com/devtayyab/FbBot.git && cd FbBot
-python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt   # Python 3.10 or newer
-cp config.example.yaml config.yaml     # set groups, destination, auto_post
-cp .env.example .env                   # paste your Qwen (DashScope) API key
-# edit knowledge.md: the facts you want replies to use
-.venv/bin/python bot.py login          # log in to your Facebook account in the Chrome window, then press Enter
+```mermaid
+flowchart TD
+    A["Post Scanned from Group Feed"] --> B{"Has an agent commented?"}
+    
+    B -- "No (New Post)" --> C["Primary Agent (e.g. Agent 1)\nDrafts helpful answer based on knowledge.md"]
+    C --> D["Store in agent_actions\nstatus: pending or approved"]
+    D --> E["Primary Agent posts top-level comment"]
+    
+    B -- "Yes (Primary Comment exists)" --> F["Secondary Agent AI Evaluation\n(Post text + Primary comment)"]
+    F --> G{"AI Collaboration Decision"}
+    
+    G -- "Existing answer is great" --> H["Action: LIKE\nSecondary agent likes primary comment"]
+    G -- "Can add complementary tip" --> I["Action: THREADED REPLY\nReplies directly under primary comment:\n'Totally agree, also check out XYZ!'"]
+    G -- "No value add needed" --> J["Action: SKIP\nIgnored to prevent spam"]
+    
+    H --> K["Execute after natural delay (e.g. 15-30m)"]
+    I --> K
 ```
 
-### Test before going live
+---
+
+## Quick Setup
+
+### 1. Setup Environment
 ```bash
-.venv/bin/python bot.py try "Coming next week with my kids, where should we stay?"   # check tone, no Facebook
-.venv/bin/python bot.py scan --debug     # real scan, drafts only, nothing is posted
-.venv/bin/python bot.py review           # approve / edit / skip
-.venv/bin/python bot.py post --dry-run   # finds the comment box, types nothing
-.venv/bin/python bot.py post             # posts approved comments
+# Activate virtual environment
+.\.venv\Scripts\activate
+
+# Install requirements
+pip install -r requirements.txt
 ```
 
-### Run every hour
-Option A, launchd (runs while you are logged in to your Mac and it is awake):
+### 2. Configure Configuration & Secrets
+1. Copy `config.example.yaml` to `config.yaml`:
+   ```bash
+   cp config.example.yaml config.yaml
+   ```
+2. Set your groups, destination, and define your agents:
+   ```yaml
+   groups:
+     - https://www.facebook.com/groups/YOUR_GROUP_ID
+
+   destination: "Lahore, Pakistan"
+
+   agents:
+     agent_1:
+       name: "Ali (Food & Living)"
+       persona: "a friendly local who knows street food and budget stays"
+       browser_channel: chrome
+       post:
+         auto_post: false
+         auto_post_min_confidence: high
+         max_per_run: 5
+         max_per_day: 15
+
+     agent_2:
+       name: "Hamza (Culture & Sights)"
+       persona: "a local architecture enthusiast who loves historical sights"
+       browser_channel: chrome
+       post:
+         auto_post: false
+         auto_post_min_confidence: high
+         max_per_run: 5
+         max_per_day: 15
+       collaboration:
+         min_delay_after_primary_mins: 15
+         allow_like: true
+         allow_reply: true
+   ```
+3. Copy `.env.example` to `.env` and fill in your API key (`DASHSCOPE_API_KEY` for Qwen or `ANTHROPIC_API_KEY` for Claude).
+
+---
+
+## Daily Commands
+
+### Login to Facebook Accounts
+Each agent maintains its own isolated Chrome profile (`data/profiles/<agent_id>/`):
 ```bash
-# run from the project folder; fills in its path
-sed "s#__PROJECT_DIR__#$PWD#g" scripts/com.fbbot.hourly.plist > ~/Library/LaunchAgents/com.fbbot.hourly.plist
-launchctl load ~/Library/LaunchAgents/com.fbbot.hourly.plist
-# stop: launchctl unload ~/Library/LaunchAgents/com.fbbot.hourly.plist
+python bot.py login --agent agent_1   # Log in to Account 1
+python bot.py login --agent agent_2   # Log in to Account 2
 ```
-Option B, terminal: `.venv/bin/python bot.py loop` (Ctrl+C stops it).
 
-### Daily use
-- `python bot.py status`: counts per status and recent failures.
-- `python bot.py history`: the last 20 posts the bot commented on (`--limit 100` for more). Each line shows the time, the author, the post, the comment, the link, and who approved it (`auto`, `review` or `edited`). The full list is in `data/comment_history.csv`, which opens in Excel or Numbers.
-- `python bot.py review`: clear drafts that were not auto-approved. A macOS notification tells you when drafts are waiting.
-- Logs: `data/logs/YYYY-MM-DD.log`.
+### Scan & Coordinate Actions
+Scans target groups, drafts top-level replies for primary agent, and coordinates Likes/Replies for secondary agents:
+```bash
+python bot.py scan
+```
 
-## Systems and access
-| What | Where | Notes |
-|---|---|---|
-| Facebook account | your own account, logged in once with `bot.py login` | Session is stored in `data/fb_profile/`. Treat that folder like a password. |
-| Browser | your installed Google Chrome, using a separate bot profile | Your normal Chrome profile is not touched. |
-| AI model | `DASHSCOPE_API_KEY` in `.env` | Qwen (`qwen-plus`) on Alibaba Cloud Model Studio by default. Local Ollama, OpenRouter or Claude are a config change; see the `llm` section of `config.example.yaml`. One short call per new post that has text. |
-| Comment history | `data/comment_history.csv` | Every post the bot commented on. Updated after each posting run and by `bot.py history`. |
-| Database | `data/bot.db` (SQLite) | Posts, drafts, statuses, and authors already seen. |
+### Review Queue
+Interactively approve, edit, or skip pending comments, threaded replies, and likes:
+```bash
+python bot.py review
+```
 
-## Interfaces
-- **In:** Facebook group pages (`?sorting_setting=CHRONOLOGICAL`) and the JSON data they load (`/api/graphql/`).
-- **Out:** comments on group posts, typed into Facebook's comment box.
-- **Sent to the AI model:** the post text only. Names and profile IDs stay on your Mac.
+### Post Approved Actions
+Executes comments, likes, and replies whose scheduled time has arrived:
+```bash
+python bot.py post               # Process due actions across all agents
+python bot.py post --agent agent_1 # Process actions for specific agent
+python bot.py post --dry-run     # Test without typing or clicking
+```
 
-## Known issues
-- **No official API.** Meta removed the Groups API in April 2024, so the bot drives a real browser. Facebook's terms do not allow automated collection or posting. The account can be rate-limited, checkpointed or restricted. Keep the limits low and reply only where you add value.
-- **Facebook changes its page data.** If a scan finds 0 posts, the raw data is saved to `data/debug/<time>/`. The parser is in `fbbot/scraper.py` (`extract_posts`). Add a captured sample to `tests/test_scraper.py` when you fix it.
-- **Login or checkpoint.** The run stops, shows a macOS notification, and exits with code 2. Run `bot.py login` and clear the check in the window.
-- **"comment box not found".** Your Facebook language may use a word that is not in the list. Add it to `post.comment_box_labels` in `config.yaml`.
-- **launchd cannot read ~/Documents.** macOS may block background jobs in Documents. Either give `/bin/zsh` Full Disk Access (System Settings > Privacy & Security), move the folder, or use `bot.py loop`.
-- **Run one command at a time.** Chrome locks the bot profile, so a second command fails while the first one is running.
-- **Qwen JSON replies.** The bot asks Qwen for JSON and checks the answer. If the answer is broken, it asks once more, then retries the post on the next scan. If a provider rejects `enable_thinking`, set `extra_body: {}`.
-- **Photos are not read.** Photo-only posts are skipped. Text with a photo is answered from the text alone.
-- **"First-time poster" means new to the bot.** The first scan records everyone already posting, so nobody is flagged on that run. After that, an author is flagged the first time the bot sees them post. Facebook does not show the bot when someone joined the group.
-- **Drafting errors.** If the model fails on a post (network or rate limit), the post is retried on the next scan. A wrong API key or model name stops the scan with one clear message.
+### Run Full Cycle or Hourly Loop
+```bash
+python bot.py run                # 1 scan + post cycle
+python bot.py loop --minutes 60  # Continuous hourly loop
+```
 
-## Links
-- Code: `fbbot/` (`scraper.py` reads posts, `drafter.py` holds the reply prompt and the Qwen / Claude calls, `poster.py` posts comments, `cli.py` holds the commands)
-- Tone and facts: `knowledge.md`, `persona` in `config.yaml`
-- Tests: `.venv/bin/python -m unittest`
+### Status & History
+```bash
+python bot.py status             # Activity per agent, ready actions, pending review
+python bot.py history            # View recent comment logs
+```
+
+### Test AI Brain Offline
+```bash
+# Test primary reply:
+python bot.py try "Coming to Lahore next week, where should I eat?" --agent agent_1
+
+# Test collaboration on an existing comment:
+python bot.py try "Coming to Lahore next week, where should I eat?" --agent agent_2 --existing-comment "Try Waris Nihari in Anarkali!" --primary-name "Ali"
+```
+
+---
+
+## Safety & Anti-Ban Features
+- **Isolated User Profiles**: Separate browser data and cookies for each agent account.
+- **Natural Time Gaps**: Configurable delays (e.g. 15-45 minutes) between primary comment and secondary reactions.
+- **No Direct Paste**: Uses human typing delays (35ms per keystroke).
+- **Anti-Messenger Protection**: Automatically avoids Facebook chat and messenger dialogs.
+- **Daily Caps**: Enforces strict `max_per_run` and `max_per_day` per account.

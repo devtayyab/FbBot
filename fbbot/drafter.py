@@ -40,6 +40,29 @@ class Analysis(BaseModel):
         return "" if value is None else value
 
 
+class CollaborationAnalysis(BaseModel):
+    action: Literal["like", "reply", "skip"] = "skip"
+    reply: str = ""
+    confidence: Literal["high", "medium", "low"] = "low"
+    reason: str = ""
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _lower(cls, value):
+        return str(value).strip().lower() if value is not None else "low"
+
+    @field_validator("action", mode="before")
+    @classmethod
+    def _lower_act(cls, value):
+        v = str(value).strip().lower() if value is not None else "skip"
+        return v if v in ("like", "reply", "skip") else "skip"
+
+    @field_validator("reply", "reason", mode="before")
+    @classmethod
+    def _none_to_empty(cls, value):
+        return "" if value is None else value
+
+
 SCHEMA = {
     "type": "object",
     "properties": {
@@ -63,6 +86,26 @@ SCHEMA = {
         "skip_reason": {"type": "string", "description": "Why no reply is needed, or empty."},
     },
     "required": ["relevant", "is_visitor", "questions", "travel_dates", "reply", "confidence", "skip_reason"],
+    "additionalProperties": False,
+}
+
+COLLABORATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": ["like", "reply", "skip"],
+            "description": "Collaborative action: 'like' to endorse good answer, 'reply' to add extra complementary tips, or 'skip'.",
+        },
+        "reply": {"type": "string", "description": "The threaded reply comment, or empty if action is like or skip."},
+        "confidence": {
+            "type": "string",
+            "enum": ["high", "medium", "low"],
+            "description": "Confidence in the action and reply.",
+        },
+        "reason": {"type": "string", "description": "Short explanation of why this action was chosen."},
+    },
+    "required": ["action", "reply", "confidence", "reason"],
     "additionalProperties": False,
 }
 
@@ -98,24 +141,56 @@ Answer with one JSON object only, no other text, with exactly these keys:
 {"relevant": boolean, "is_visitor": boolean, "questions": [string], "travel_dates": string,
  "reply": string, "confidence": "high" | "medium" | "low", "skip_reason": string}"""
 
+COLLABORATION_SYSTEM_TEMPLATE = """You are {persona} in {destination}.
+Another helpful local member ({primary_agent_name}) has already commented on this Facebook post:
+<existing_comment>
+{primary_comment}
+</existing_comment>
+
+Your role is to collaborate naturally with other community members without spamming:
+1. "like": If the existing answer is already accurate, helpful, and sufficient, choose "like" to endorse it. Leave "reply" empty.
+2. "reply": If you can genuinely add an additional, complementary local tip, alternative suggestion, or practical advice that expands on the existing answer:
+   - Keep reply to ONE short sentence, at most {max_words} words.
+   - Warm, conversational, direct reply in the same language as the post.
+   - Mention prices or rules only if supported by your trusted local notes.
+   - Do NOT repeat what the existing comment already said.
+   - Never sound like an AI, never use hashtags or corporate tone.
+3. "skip": If the post or discussion is no longer relevant, already crowded, or not worth adding to.
+
+Trusted local notes:
+<notes>
+{knowledge}
+</notes>"""
+
+COLLABORATION_JSON_FORMAT = """
+
+Answer with one JSON object only, no other text, with exactly these keys:
+{"action": "like" | "reply" | "skip", "reply": string, "confidence": "high" | "medium" | "low", "reason": string}"""
+
 
 class Drafter:
     def __init__(self, cfg: dict):
-        llm = cfg["llm"]
-        provider = (llm.get("provider") or "qwen").lower()
-        model = llm.get("model") or DEFAULT_MODELS.get(provider, "")
+        self.cfg = cfg
+        self.llm = cfg["llm"]
+        self.provider = (self.llm.get("provider") or "qwen").lower()
+        self.model = self.llm.get("model") or DEFAULT_MODELS.get(self.provider, "")
+        self.destination = cfg.get("destination", "")
+        self.persona = cfg.get("persona", "")
+        self.max_words = int(self.llm.get("max_reply_words", 40))
+        self.knowledge = load_knowledge(cfg.get("knowledge_file"))
+
         system = SYSTEM_TEMPLATE.format(
-            destination=cfg["destination"],
-            persona=cfg["persona"],
-            max_words=int(llm["max_reply_words"]),
-            knowledge=load_knowledge(),
+            destination=self.destination,
+            persona=self.persona,
+            max_words=self.max_words,
+            knowledge=self.knowledge,
         )
-        if provider == "claude":
-            self._backend = _ClaudeBackend(model, llm, system)
-        elif provider == "qwen":
-            self._backend = _QwenBackend(model, llm, system + JSON_FORMAT)
+        if self.provider == "claude":
+            self._backend = _ClaudeBackend(self.model, self.llm, system)
+        elif self.provider == "qwen":
+            self._backend = _QwenBackend(self.model, self.llm, system + JSON_FORMAT)
         else:
-            raise SystemExit(f"llm.provider must be qwen or claude, not {provider!r}")
+            raise SystemExit(f"llm.provider must be qwen or claude, not {self.provider!r}")
         # Errors that mean the setup is wrong (key, model name): every post would fail the same way.
         self.setup_errors: tuple[type[Exception], ...] = self._backend.setup_errors
 
@@ -143,6 +218,49 @@ class Drafter:
             analysis.skip_reason = analysis.skip_reason or "no reply drafted"
         return analysis
 
+    def analyze_collaboration(
+        self,
+        post_text: str,
+        primary_comment: str,
+        primary_agent_name: str = "a fellow local",
+    ) -> CollaborationAnalysis | None:
+        """Decide whether to like the existing comment, reply with complementary tips, or skip."""
+        collab_system = COLLABORATION_SYSTEM_TEMPLATE.format(
+            destination=self.destination,
+            persona=self.persona,
+            primary_agent_name=primary_agent_name,
+            primary_comment=primary_comment,
+            max_words=self.max_words,
+            knowledge=self.knowledge,
+        )
+        if self.provider == "qwen":
+            collab_system += COLLABORATION_JSON_FORMAT
+
+        user = (
+            f"Today is {dt.date.today():%A, %d %B %Y}. Another local member ({primary_agent_name}) "
+            f"has already replied to this post.\n\n"
+            f"<post>\n{post_text}\n</post>\n\n"
+            f"<existing_comment>\n{primary_comment}\n</existing_comment>"
+        )
+
+        last_error: Exception | None = None
+        for _ in range(2):
+            raw = self._backend.complete(user, system_override=collab_system, schema_override=COLLABORATION_SCHEMA)
+            if raw is None:
+                return None
+            try:
+                collab = CollaborationAnalysis.model_validate_json(_extract_json(raw))
+                break
+            except (ValidationError, ValueError) as exc:
+                last_error = exc
+        else:
+            raise RuntimeError(f"model did not return valid JSON for collaboration: {last_error}")
+
+        collab.reply = _clean(collab.reply)
+        if collab.action == "reply" and not collab.reply:
+            collab.action = "like"
+        return collab
+
 
 class _QwenBackend:
     """Qwen through an OpenAI-compatible chat completions API."""
@@ -164,10 +282,11 @@ class _QwenBackend:
         self.extra_body = llm.get("extra_body") or None
         self.setup_errors = (openai.AuthenticationError, openai.PermissionDeniedError, openai.NotFoundError)
 
-    def complete(self, user: str) -> str | None:
+    def complete(self, user: str, system_override: str | None = None, schema_override: dict | None = None) -> str | None:
+        sys_prompt = system_override if system_override is not None else self.system
         response = self.client.chat.completions.create(
             model=self.model,
-            messages=[{"role": "system", "content": self.system}, {"role": "user", "content": user}],
+            messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": user}],
             response_format={"type": "json_object"},
             max_tokens=800,
             extra_body=self.extra_body,  # e.g. {"enable_thinking": false} for Alibaba Cloud
@@ -192,7 +311,9 @@ class _ClaudeBackend:
         self.system = system
         self.setup_errors = (anthropic.AuthenticationError, anthropic.PermissionDeniedError, anthropic.NotFoundError)
 
-    def complete(self, user: str) -> str | None:
+    def complete(self, user: str, system_override: str | None = None, schema_override: dict | None = None) -> str | None:
+        sys_prompt = system_override if system_override is not None else self.system
+        target_schema = schema_override if schema_override is not None else SCHEMA
         response = self.client.beta.messages.create(
             model=self.model,
             max_tokens=4_000,
@@ -200,9 +321,9 @@ class _ClaudeBackend:
             fallbacks="default",  # retry on a fallback model if the main one declines
             output_config={
                 "effort": self.effort,
-                "format": {"type": "json_schema", "schema": SCHEMA},
+                "format": {"type": "json_schema", "schema": target_schema},
             },
-            system=[{"type": "text", "text": self.system, "cache_control": {"type": "ephemeral"}}],
+            system=[{"type": "text", "text": sys_prompt, "cache_control": {"type": "ephemeral"}}],
             messages=[{"role": "user", "content": user}],
         )
         if response.stop_reason == "refusal":

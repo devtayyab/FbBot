@@ -1,7 +1,7 @@
 """Offline tests for parsing model output. Run: .venv/bin/python -m unittest"""
 import unittest
 
-from fbbot.drafter import Analysis, _clean, _extract_json
+from fbbot.drafter import Analysis, CollaborationAnalysis, _clean, _extract_json
 
 
 class ExtractJsonTest(unittest.TestCase):
@@ -18,6 +18,21 @@ class ExtractJsonTest(unittest.TestCase):
         self.assertEqual(a.confidence, "high")
         self.assertEqual(a.travel_dates, "")
         self.assertEqual(a.questions, [])
+
+    def test_collaboration_analysis(self):
+        c = CollaborationAnalysis.model_validate_json(
+            '{"action": "Reply", "reply": "Agree with Ali!", "confidence": "HIGH", "reason": "Adds tip"}'
+        )
+        self.assertEqual(c.action, "reply")
+        self.assertEqual(c.reply, "Agree with Ali!")
+        self.assertEqual(c.confidence, "high")
+
+    def test_collaboration_like_action(self):
+        c = CollaborationAnalysis.model_validate_json(
+            '{"action": "like", "reply": null, "confidence": "medium", "reason": "Already answered"}'
+        )
+        self.assertEqual(c.action, "like")
+        self.assertEqual(c.reply, "")
 
     def test_clean_removes_newlines_and_quotes(self):
         self.assertEqual(_clean('"Take the metro.\nIt is fast."'), "Take the metro. It is fast.")

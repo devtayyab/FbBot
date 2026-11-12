@@ -13,9 +13,11 @@ import json
 import random
 import re
 from collections import deque
+from typing import TYPE_CHECKING
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from playwright.sync_api import BrowserContext
+if TYPE_CHECKING:
+    from playwright.sync_api import BrowserContext
 
 from .browser import ensure_logged_in
 from .config import DEBUG_DIR

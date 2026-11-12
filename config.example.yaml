@@ -1,48 +1,78 @@
-# Copy to config.yaml and fill in. Only `groups` and `destination` are required.
+# Copy to config.yaml and fill in.
+#
+# You can run this bot in two modes:
+# 1. Single Agent (simple default)
+# 2. Multi-Agent Swarm (coordinated accounts with like & threaded reply synergy)
 
 # Facebook groups to watch: the full group URL from your browser
 groups:
   - https://www.facebook.com/groups/YOUR_GROUP_ID_OR_NAME
 
-# Where visitors are coming to (used in the reply prompt)
-destination: "YOUR_CITY, Country"
+# Destination (the place visitors are coming to)
+destination: "Lahore, Pakistan"
 
-# How the comments should sound
-persona: "a friendly local who has lived here for years and likes helping visitors"
-
-# "chrome" = your installed Google Chrome with a separate bot profile.
-# "chromium" = Playwright's bundled browser.
-browser_channel: chrome
-
+# Global scan settings
 scan:
   scrolls: 8               # how far down the "New posts" feed to load each run
   max_post_age_hours: 48   # never reply to posts older than this
-  headless: false          # false = you see the browser; Facebook works more reliably
+  headless: false          # false = visible browser; true = background
 
-post:
-  # false: every draft waits for `python bot.py review`.
-  # true:  drafts Claude rates at auto_post_min_confidence or above are posted
-  #        without review; the rest still wait for review.
-  auto_post: false
-  auto_post_min_confidence: high   # high | medium | low
-  max_per_run: 5           # comments per hourly run
-  max_per_day: 15          # hard daily cap across all runs
-  min_delay_seconds: 90    # random pause between two comments
-  max_delay_seconds: 240
-  comment_box_labels: []   # extra words from your Facebook language's comment box label
-
+# Shared LLM settings (default for all agents, can be overridden per agent)
 llm:
-  # Qwen through any OpenAI-compatible API. Default: Alibaba Cloud Model Studio (DashScope).
-  provider: qwen
+  provider: qwen           # qwen | claude
   model: qwen-plus
-  base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1   # Singapore region
-  #   US (Virginia):       https://dashscope-us.aliyuncs.com/compatible-mode/v1
-  #   China (Beijing):     https://dashscope.aliyuncs.com/compatible-mode/v1
-  #   Local Ollama (free): http://localhost:11434/v1   with model: qwen3:8b  and extra_body: {}
-  #   OpenRouter:          https://openrouter.ai/api/v1  with api_key_env: OPENROUTER_API_KEY, extra_body: {}
-  api_key_env: DASHSCOPE_API_KEY   # name of the variable in .env that holds the key
+  base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+  api_key_env: DASHSCOPE_API_KEY
   extra_body:
-    enable_thinking: false         # Alibaba Cloud only: JSON output needs thinking off
+    enable_thinking: false
   max_reply_words: 40
 
-  # To use Claude instead: provider: claude, model: claude-opus-5-5, effort: low (key: ANTHROPIC_API_KEY)
+# Single-agent default persona & settings (used if 'agents' section below is omitted)
+persona: "a friendly local who has lived here for years and likes helping visitors"
+browser_channel: chrome
+post:
+  auto_post: false
+  auto_post_min_confidence: high   # high | medium | low
+  max_per_run: 5
+  max_per_day: 15
+  min_delay_seconds: 90
+  max_delay_seconds: 240
+  comment_box_labels: []
+
+# ----------------------------------------------------------------------------
+# Multi-Agent Swarm Configuration (Optional)
+# If defined, the bot runs as a coordinated team:
+# - Primary agent drafts the top-level response.
+# - Secondary agents evaluate whether to LIKE the primary comment or add a
+#   THREADED REPLY with complementary tips, after a natural delay.
+# ----------------------------------------------------------------------------
+agents:
+  agent_1:
+    name: "Ali (Food & Living)"
+    persona: "a friendly local who has lived in Lahore for 10 years and knows street food, old city, and budget stays"
+    knowledge_file: "knowledge.md"
+    browser_channel: chrome
+    post:
+      auto_post: false
+      auto_post_min_confidence: high
+      max_per_run: 5
+      max_per_day: 15
+      min_delay_seconds: 90
+      max_delay_seconds: 240
+
+  agent_2:
+    name: "Hamza (Culture & Sights)"
+    persona: "a passionate local heritage guide who loves recommending historical architecture, museums, and safe walking tips"
+    knowledge_file: "knowledge.md"
+    browser_channel: chrome
+    post:
+      auto_post: false
+      auto_post_min_confidence: high
+      max_per_run: 5
+      max_per_day: 15
+      min_delay_seconds: 90
+      max_delay_seconds: 240
+    collaboration:
+      min_delay_after_primary_mins: 15  # wait at least 15m after primary comment before liking/replying
+      allow_like: true                  # can like primary agent's comment
+      allow_reply: true                 # can post threaded reply to primary comment
