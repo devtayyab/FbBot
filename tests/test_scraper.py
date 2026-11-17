@@ -66,6 +66,24 @@ class ExtractTest(unittest.TestCase):
         blob = "for (;;);" + json.dumps({"a": 1}) + "\n" + json.dumps({"b": 2}) + "\nnot json"
         self.assertEqual(parse_blob(blob), [{"a": 1}, {"b": 2}])
 
+    def test_extracts_nested_story_comments(self):
+        story = {
+            "__typename": "Story",
+            "post_id": "333",
+            "url": "https://www.facebook.com/groups/travelgroup/posts/333/",
+            "message": {"text": "Best biryani in Lahore?"},
+            "feedback": {
+                "display_comments": {
+                    "edges": [
+                        {"node": {"__typename": "Comment", "author": {"name": "Bilal"}, "body": {"text": "Try Gulberg!"}}}
+                    ]
+                }
+            },
+        }
+        posts = extract_posts(story)
+        self.assertIn("333", posts)
+        self.assertEqual(posts["333"]["comments"], [{"author": "Bilal", "text": "Try Gulberg!"}])
+
 
 if __name__ == "__main__":
     unittest.main()

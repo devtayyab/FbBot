@@ -67,12 +67,19 @@ def load_env() -> None:
     """
     if not ENV_PATH.exists():
         return
-    for line in ENV_PATH.read_text().splitlines():
+    for line in ENV_PATH.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+def _validate_confidence(value: object, context: str = "post.auto_post_min_confidence") -> str:
+    confidence = str(value).strip().lower()
+    if confidence not in ("high", "medium", "low"):
+        raise SystemExit(f"{context} in config.yaml must be high, medium or low.")
+    return confidence
 
 
 def load_config(require_groups: bool = True, require_destination: bool | None = None) -> dict:
@@ -81,7 +88,7 @@ def load_config(require_groups: bool = True, require_destination: bool | None = 
         raise SystemExit(
             "config.yaml is missing. Run: cp config.example.yaml config.yaml, then fill in your group URL."
         )
-    cfg = _merge(DEFAULTS, yaml.safe_load(CONFIG_PATH.read_text()) or {})
+    cfg = _merge(DEFAULTS, yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {})
     if require_destination is None:
         require_destination = require_groups
     if require_groups:
@@ -91,10 +98,10 @@ def load_config(require_groups: bool = True, require_destination: bool | None = 
     if require_destination:
         if not cfg.get("destination") or "YOUR_CITY" in cfg["destination"]:
             raise SystemExit("Set 'destination' in config.yaml (the place visitors are coming to).")
-    confidence = str(cfg["post"]["auto_post_min_confidence"]).strip().lower()
-    if confidence not in ("high", "medium", "low"):
-        raise SystemExit("post.auto_post_min_confidence in config.yaml must be high, medium or low.")
-    cfg["post"]["auto_post_min_confidence"] = confidence
+    cfg["post"]["auto_post_min_confidence"] = _validate_confidence(cfg["post"]["auto_post_min_confidence"])
+    if isinstance(cfg.get("agents"), dict):
+        for aid in cfg["agents"]:
+            get_agent_config(cfg, aid)  # validate per-agent overrides early
     for path in (DATA, DEBUG_DIR, LOG_DIR):
         path.mkdir(parents=True, exist_ok=True)
     return cfg
@@ -128,8 +135,14 @@ def get_agents(cfg: dict) -> dict[str, dict]:
 def get_agent_config(cfg: dict, agent_id: str) -> dict:
     """Merge agent-specific settings with global configuration."""
     base = copy.deepcopy(cfg)
-    agent_overrides = (cfg.get("agents") or {}).get(agent_id, {})
-    
+    agent_overrides = (cfg.get("agents") or {}).get(agent_id) or {}
+
+    post_cfg = _merge(base.get("post", {}), agent_overrides.get("post") or {})
+    post_cfg["auto_post_min_confidence"] = _validate_confidence(
+        post_cfg.get("auto_post_min_confidence", "high"),
+        context=f"agents.{agent_id}.post.auto_post_min_confidence",
+    )
+
     agent_merged = {
         "agent_id": agent_id,
         "name": agent_overrides.get("name", agent_id),
@@ -138,14 +151,16 @@ def get_agent_config(cfg: dict, agent_id: str) -> dict:
         "groups": base.get("groups", []),
         "browser_channel": agent_overrides.get("browser_channel", base.get("browser_channel", "chrome")),
         "knowledge_file": agent_overrides.get("knowledge_file", "knowledge.md"),
-        "scan": _merge(base.get("scan", {}), agent_overrides.get("scan", {})),
-        "post": _merge(base.get("post", {}), agent_overrides.get("post", {})),
-        "llm": _merge(base.get("llm", {}), agent_overrides.get("llm", {})),
+        "scan": _merge(base.get("scan", {}), agent_overrides.get("scan") or {}),
+        "post": post_cfg,
+        "llm": _merge(base.get("llm", {}), agent_overrides.get("llm") or {}),
         "collaboration": _merge({
             "min_delay_after_primary_mins": 15,
             "allow_like": True,
             "allow_reply": True,
-        }, agent_overrides.get("collaboration", {})),
+            "allow_like_and_reply": True,
+            "allow_better_comment": True,
+        }, agent_overrides.get("collaboration") or {}),
     }
     return agent_merged
 
@@ -157,7 +172,7 @@ def load_knowledge(knowledge_file: str | pathlib.Path | None = None) -> str:
         path = p if p.is_absolute() else (ROOT / p)
     if not path.exists():
         if path != KNOWLEDGE_PATH and KNOWLEDGE_PATH.exists():
-            return KNOWLEDGE_PATH.read_text().strip() or "(no local notes yet)"
+            return KNOWLEDGE_PATH.read_text(encoding="utf-8").strip() or "(no local notes yet)"
         return "(no local notes yet)"
-    text = path.read_text().strip()
+    text = path.read_text(encoding="utf-8").strip()
     return text or "(no local notes yet)"

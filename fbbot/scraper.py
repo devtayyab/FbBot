@@ -99,6 +99,27 @@ def _pick_time(d: dict):
     return None
 
 
+def _extract_story_comments(story_obj: dict) -> list[dict]:
+    """Extract preview/existing comments nested inside a Story JSON payload."""
+    comments: list[dict] = []
+    seen_texts: set[str] = set()
+    for node in _walk(story_obj):
+        if node.get("__typename") != "Comment":
+            continue
+        body = node.get("body") or node.get("preferred_body") or {}
+        text = body.get("text") if isinstance(body, dict) else None
+        if not isinstance(text, str) or not text.strip():
+            continue
+        clean_text = text.strip()
+        if clean_text in seen_texts:
+            continue
+        seen_texts.add(clean_text)
+        author = node.get("author")
+        author_name = author.get("name") if isinstance(author, dict) else None
+        comments.append({"author": author_name or "Someone", "text": clean_text})
+    return comments
+
+
 def extract_posts(payload) -> dict[str, dict]:
     """Find group posts in one Facebook JSON payload, keyed by post_id."""
     found: dict[str, dict] = {}
@@ -122,6 +143,9 @@ def extract_posts(payload) -> dict[str, dict]:
         if actor:
             record["author_name"] = actor.get("name")
             record["author_id"] = str(actor["id"]) if actor.get("id") else None
+        comments = _extract_story_comments(d)
+        if comments:
+            record["comments"] = comments
         _merge_into(found, record)
     return found
 
@@ -186,8 +210,8 @@ def _dump_debug(group_url: str, html: str, bodies: list[str], posts: dict) -> No
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     folder = DEBUG_DIR / stamp
     folder.mkdir(parents=True, exist_ok=True)
-    (folder / "page.html").write_text(html)
-    (folder / "graphql.txt").write_text("\n\n----\n\n".join(bodies))
-    (folder / "posts.json").write_text(json.dumps(posts, indent=2, ensure_ascii=False))
-    (folder / "group.txt").write_text(group_url)
+    (folder / "page.html").write_text(html, encoding="utf-8")
+    (folder / "graphql.txt").write_text("\n\n----\n\n".join(bodies), encoding="utf-8")
+    (folder / "posts.json").write_text(json.dumps(posts, indent=2, ensure_ascii=False), encoding="utf-8")
+    (folder / "group.txt").write_text(group_url, encoding="utf-8")
     print(f"  debug files saved to {folder}")

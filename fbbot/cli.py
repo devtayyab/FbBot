@@ -28,7 +28,7 @@ def _browser(agent_cfg: dict, agent_id: str = "default", headless: bool | None =
 
 
 def _notify(message: str) -> None:
-    """Show a notification; ignore errors on other systems."""
+    """Show a macOS notification; ignore errors on other systems."""
     try:
         subprocess.run(
             ["osascript", "-e", f'display notification "{message}" with title "FB Bot"'],
@@ -38,21 +38,168 @@ def _notify(message: str) -> None:
         pass
 
 
+def _pick_primary_agent(agents: dict[str, dict], store: Store, index: int, forced_agent: str | None = None) -> str:
+    """Select which agent acts as primary commenter for a post (round-robin among eligible agents)."""
+    agent_ids = list(agents.keys())
+    if forced_agent and forced_agent in agents:
+        return forced_agent
+    eligible = [
+        aid for aid in agent_ids
+        if store.posted_today_by_agent(aid) < int(agents[aid]["post"]["max_per_day"])
+    ]
+    pool = eligible or agent_ids
+    return pool[index % len(pool)]
+
+
+def _coordinate_post(
+    store: Store,
+    post_id: str,
+    post_text: str,
+    agents: dict[str, dict],
+    drafters: dict,
+    primary_info: dict,
+) -> int:
+    """Have other agents evaluate an approved/posted comment and decide: better comment, like+reply, like, or skip."""
+    primary_content = primary_info["content"]
+    primary_owner = primary_info.get("agent_id", "default")
+    primary_action_id = primary_info.get("action_id")
+    primary_name = agents.get(primary_owner, {}).get("name", primary_owner)
+    created_count = 0
+
+    for sec_id, sec_drafter in drafters.items():
+        if sec_id == primary_owner or store.has_agent_acted(post_id, sec_id):
+            continue
+
+        sec_cfg = agents[sec_id]
+        collab_cfg = sec_cfg.get("collaboration", {})
+        existing_replies = store.get_existing_replies(post_id)
+
+        try:
+            collab = sec_drafter.analyze_collaboration(
+                post_text=post_text,
+                primary_comment=primary_content,
+                primary_agent_name=primary_name,
+                existing_replies=existing_replies,
+            )
+        except Exception as exc:
+            if isinstance(exc, sec_drafter.setup_errors):
+                raise SystemExit(f"AI model setup problem for {sec_id} (check API key/model): {exc}")
+            print(f"  collaboration check failed for {sec_id}: {exc!r}")
+            continue
+
+        if not collab or collab.action == "skip":
+            store.add_action(
+                post_id=post_id,
+                agent_id=sec_id,
+                action_type="skip",
+                target_action_id=primary_action_id,
+                status="skipped",
+                analysis=collab.model_dump() if collab else None,
+            )
+            continue
+
+        action = collab.action
+        # Respect agent collaboration feature flags cleanly
+        if action == "comment" and not collab_cfg.get("allow_better_comment", True):
+            action = "like_and_reply" if collab.reply else "like"
+        if action == "like_and_reply":
+            allow_like = collab_cfg.get("allow_like", True)
+            allow_reply = collab_cfg.get("allow_reply", True)
+            if not collab_cfg.get("allow_like_and_reply", True) or (not allow_like and allow_reply):
+                action = "reply" if allow_reply else ("like" if allow_like else "skip")
+            elif allow_like and not allow_reply:
+                action = "like"
+            elif not allow_like and not allow_reply:
+                action = "skip"
+        elif action == "reply" and not collab_cfg.get("allow_reply", True):
+            action = "like" if collab_cfg.get("allow_like", True) else "skip"
+        elif action == "like" and not collab_cfg.get("allow_like", True):
+            action = "skip"
+
+        if action == "skip":
+            store.add_action(
+                post_id=post_id,
+                agent_id=sec_id,
+                action_type="skip",
+                target_action_id=primary_action_id,
+                status="skipped",
+                analysis=collab.model_dump(),
+            )
+            continue
+
+        delay_mins = int(collab_cfg.get("min_delay_after_primary_mins", 15))
+        base_time = dt.datetime.now()
+        if primary_info.get("executed_at"):
+            try:
+                base_time = dt.datetime.fromisoformat(primary_info["executed_at"])
+            except ValueError:
+                pass
+        sched_time = (base_time + dt.timedelta(minutes=delay_mins)).isoformat(timespec="seconds")
+
+        sec_auto = sec_cfg["post"]["auto_post"]
+        sec_min_rank = CONFIDENCE_RANK[sec_cfg["post"]["auto_post_min_confidence"]]
+        sec_auto_approved = sec_auto and CONFIDENCE_RANK[collab.confidence] >= sec_min_rank
+        sec_status = "approved" if sec_auto_approved else "pending"
+        sec_by = "auto" if sec_auto_approved else None
+
+        content = collab.reply if action in ("comment", "reply", "like_and_reply") else ""
+        store.add_action(
+            post_id=post_id,
+            agent_id=sec_id,
+            action_type=action,
+            content=content,
+            target_action_id=primary_action_id,
+            target_agent_id=primary_owner,
+            target_comment_text="" if action == "comment" else primary_content,
+            confidence=collab.confidence,
+            analysis=collab.model_dump(),
+            status=sec_status,
+            approved_by=sec_by,
+            delay_minutes=delay_mins,
+            scheduled_after=sched_time,
+        )
+        created_count += 1
+        labels = {
+            "comment": f"BETTER COMMENT: '{content}'",
+            "like_and_reply": f"LIKE + REPLY: '{content}'",
+            "reply": f"REPLY: '{content}'",
+            "like": "LIKE",
+        }
+        print(f"  -> [{sec_id}] Planned {labels.get(action, action)} on [{primary_name}] (delay {delay_mins}m)")
+
+    return created_count
+
+
 # ---- login ----------------------------------------------------------------
 
 def cmd_login(cfg: dict, args) -> None:
-    agent_id = getattr(args, "agent", None) or "default"
     agents = get_agents(cfg)
-    if agent_id not in agents and len(agents) > 0 and agent_id == "default":
-        agent_id = list(agents.keys())[0]
-    agent_cfg = agents.get(agent_id) or get_agent_config(cfg, agent_id)
+    forced = getattr(args, "agent", None)
 
-    print(f"Logging in Facebook for agent '{agent_id}' ({agent_cfg.get('name', agent_id)})...")
-    with _browser(agent_cfg, agent_id=agent_id, headless=False) as ctx:
-        page = ctx.new_page()
-        page.goto("https://www.facebook.com/")
-        input(f"Log in to Facebook for agent '{agent_id}' in the browser window, then press Enter here... ")
-    print(f"Saved. Profile for agent '{agent_id}' is ready.")
+    if forced:
+        if forced not in agents:
+            print(f"Note: '{forced}' is not in config.yaml agents ({', '.join(agents.keys())}), logging in anyway.")
+        targets = [forced]
+    elif len(agents) > 1:
+        print("Configured agents:", ", ".join(agents.keys()))
+        choice = input("Which agent to log in? (enter agent id or 'all') [all]: ").strip() or "all"
+        if choice.lower() == "all":
+            targets = list(agents.keys())
+        elif choice in agents:
+            targets = [choice]
+        else:
+            raise SystemExit(f"Unknown agent '{choice}'. Choose from: {', '.join(agents.keys())}")
+    else:
+        targets = list(agents.keys())
+
+    for agent_id in targets:
+        agent_cfg = agents.get(agent_id) or get_agent_config(cfg, agent_id)
+        print(f"Logging in Facebook for agent '{agent_id}' ({agent_cfg.get('name', agent_id)})...")
+        with _browser(agent_cfg, agent_id=agent_id, headless=False) as ctx:
+            page = ctx.new_page()
+            page.goto("https://www.facebook.com/")
+            input(f"Log in to Facebook for agent '{agent_id}' in the browser window (incl. 2FA), then press Enter... ")
+        print(f"Saved. Profile for agent '{agent_id}' is ready.")
 
 
 # ---- scan -----------------------------------------------------------------
@@ -63,31 +210,33 @@ def cmd_scan(cfg: dict, args) -> None:
 
     agents = get_agents(cfg)
     agent_ids = list(agents.keys())
-    primary_id = agent_ids[0]
-    primary_cfg = agents[primary_id]
-    primary_drafter = Drafter(primary_cfg)
+    forced_agent = getattr(args, "agent", None)
+    if forced_agent and forced_agent not in agents:
+        raise SystemExit(f"Unknown agent '{forced_agent}'. Configured agents: {', '.join(agent_ids)}")
 
-    # Secondary drafters for collaborative swarm
-    secondary_drafters = {
-        aid: Drafter(agents[aid]) for aid in agent_ids[1:]
-    }
+    scout_id = forced_agent or agent_ids[0]
+    scout_cfg = agents[scout_id]
+    drafters = {aid: Drafter(acfg) for aid, acfg in agents.items()}
 
     max_age = dt.timedelta(hours=cfg["scan"]["max_post_age_hours"])
     new_count = drafted = auto_approved = draft_errors = 0
     coordinated_actions = 0
 
-    with Store() as store, _browser(primary_cfg, agent_id=primary_id) as ctx:
+    with Store() as store, _browser(scout_cfg, agent_id=scout_id) as ctx:
         baseline = store.is_empty()
+        rotation_idx = store.total_posts()
+
         for group_url in cfg["groups"]:
-            print(f"Scanning {group_url} (Scout: {primary_id})...")
+            print(f"Scanning {group_url} (Scout: {scout_id})...")
             posts = scrape_group(ctx, group_url, cfg["scan"]["scrolls"], debug=args.debug)
             print(f"  {len(posts)} posts loaded")
 
             for post in posts:
                 post_id = post["post_id"]
-                primary_comment_info = store.get_primary_comment(post_id)
+                if post.get("comments") and store.has_post(post_id):
+                    store.save_existing_comments(post_id, post["comments"])
 
-                # Process new post
+                # Process brand-new post
                 if not store.has_post(post_id):
                     new_count += 1
                     created = post.get("created_at")
@@ -99,111 +248,119 @@ def cmd_scan(cfg: dict, args) -> None:
                         continue
 
                     first_time = store.add_post(post, group_url, "new", baseline=baseline)
-                    try:
-                        analysis = primary_drafter.analyze(post["text"], first_time_poster=first_time)
-                    except Exception as exc:
-                        store.discard_post(post_id)
-                        if isinstance(exc, primary_drafter.setup_errors):
-                            raise SystemExit(f"AI model setup problem (check API key): {exc}")
-                        draft_errors += 1
-                        print(f"  drafting failed, will retry next scan: {exc!r}")
-                        continue
+                    primary_id = _pick_primary_agent(agents, store, rotation_idx, forced_agent=forced_agent)
+                    rotation_idx += 1
+                    primary_cfg = agents[primary_id]
+                    primary_drafter = drafters[primary_id]
 
-                    if analysis is None:
-                        store.set_status(post_id, "ignored", "model declined to draft")
-                        continue
-                    if not analysis.relevant:
-                        store.save_analysis(post_id, analysis.model_dump(), "ignored")
-                        continue
-
-                    drafted += 1
-                    auto = primary_cfg["post"]["auto_post"]
-                    min_rank = CONFIDENCE_RANK[primary_cfg["post"]["auto_post_min_confidence"]]
-                    is_auto = auto and CONFIDENCE_RANK[analysis.confidence] >= min_rank
-                    status = "approved" if is_auto else "pending"
-                    by = "auto" if is_auto else None
-
-                    store.save_analysis(post_id, analysis.model_dump(), status)
-                    if is_auto:
-                        store.approve(post_id, analysis.reply, by="auto")
-                        auto_approved += 1
-
-                    store.add_action(
-                        post_id=post_id,
-                        agent_id=primary_id,
-                        action_type="comment",
-                        content=analysis.reply,
-                        confidence=analysis.confidence,
-                        analysis=analysis.model_dump(),
-                        status=status,
-                        approved_by=by,
-                    )
-
-                    tag = " [first-time poster]" if first_time else ""
-                    print(f"  + [{primary_id}] {post.get('author_name') or '?'}{tag}: {analysis.reply}")
-                    primary_comment_info = {"agent_id": primary_id, "content": analysis.reply}
-
-                # Evaluate collaborative actions for other agents
-                if primary_comment_info and secondary_drafters and post.get("text"):
-                    primary_content = primary_comment_info["content"]
-                    primary_owner = primary_comment_info.get("agent_id", primary_id)
-                    primary_name = agents.get(primary_owner, {}).get("name", primary_owner)
-
-                    for sec_id, sec_drafter in secondary_drafters.items():
-                        if store.has_agent_acted(post_id, sec_id):
-                            continue
-                        sec_cfg = agents[sec_id]
-                        collab_cfg = sec_cfg.get("collaboration", {})
-
+                    ext_comments = post.get("comments") or []
+                    if ext_comments:
+                        # Existing comment(s) from Facebook members already present!
+                        # Evaluate whether primary agent can write a better comment or like+reply.
+                        first_ext = ext_comments[0]
                         try:
-                            collab = sec_drafter.analyze_collaboration(
+                            collab = primary_drafter.analyze_collaboration(
                                 post_text=post["text"],
-                                primary_comment=primary_content,
-                                primary_agent_name=primary_name,
+                                primary_comment=first_ext["text"],
+                                primary_agent_name=first_ext.get("author") or "a group member",
+                                existing_replies=[c["text"] for c in ext_comments[1:]],
                             )
                         except Exception as exc:
-                            print(f"  collaboration check failed for {sec_id}: {exc}")
+                            store.discard_post(post_id)
+                            if isinstance(exc, primary_drafter.setup_errors):
+                                raise SystemExit(f"AI model setup problem (check API key/model): {exc}")
+                            draft_errors += 1
+                            print(f"  drafting failed, will retry next scan: {exc!r}")
                             continue
 
                         if not collab or collab.action == "skip":
-                            store.add_action(
-                                post_id=post_id,
-                                agent_id=sec_id,
-                                action_type="skip",
-                                status="skipped",
-                                analysis=collab.model_dump() if collab else None,
+                            store.save_analysis(
+                                post_id,
+                                collab.model_dump() if collab else {"skip_reason": "existing comments sufficient"},
+                                "ignored",
                             )
                             continue
 
-                        if collab.action == "like" and not collab_cfg.get("allow_like", True):
-                            continue
-                        if collab.action == "reply" and not collab_cfg.get("allow_reply", True):
-                            collab.action = "like"
+                        drafted += 1
+                        auto = primary_cfg["post"]["auto_post"]
+                        min_rank = CONFIDENCE_RANK[primary_cfg["post"]["auto_post_min_confidence"]]
+                        is_auto = auto and CONFIDENCE_RANK[collab.confidence] >= min_rank
+                        status = "approved" if is_auto else "pending"
+                        by = "auto" if is_auto else None
+                        content = collab.reply if collab.action in ("comment", "reply", "like_and_reply") else ""
 
-                        delay_mins = int(collab_cfg.get("min_delay_after_primary_mins", 15))
-                        sched_time = (dt.datetime.now() + dt.timedelta(minutes=delay_mins)).isoformat(timespec="seconds")
-                        sec_auto = sec_cfg["post"]["auto_post"]
-                        sec_min_rank = CONFIDENCE_RANK[sec_cfg["post"]["auto_post_min_confidence"]]
-                        sec_auto_approved = sec_auto and CONFIDENCE_RANK[collab.confidence] >= sec_min_rank
-                        sec_status = "approved" if sec_auto_approved else "pending"
-                        sec_by = "auto" if sec_auto_approved else None
+                        store.save_analysis(post_id, collab.model_dump(), status, primary_agent_id=primary_id)
+                        if collab.action == "comment" and is_auto:
+                            store.approve(post_id, content, by="auto", primary_agent_id=primary_id)
+                            auto_approved += 1
+                        elif is_auto:
+                            auto_approved += 1
 
                         store.add_action(
                             post_id=post_id,
-                            agent_id=sec_id,
+                            agent_id=primary_id,
                             action_type=collab.action,
-                            content=collab.reply if collab.action == "reply" else "",
-                            target_agent_id=primary_owner,
-                            target_comment_text=primary_content,
+                            content=content,
+                            target_agent_id=first_ext.get("author") or "group_member",
+                            target_comment_text="" if collab.action == "comment" else first_ext["text"],
                             confidence=collab.confidence,
                             analysis=collab.model_dump(),
-                            status=sec_status,
-                            approved_by=sec_by,
-                            scheduled_after=sched_time,
+                            status=status,
+                            approved_by=by,
                         )
-                        coordinated_actions += 1
-                        act_lbl = f"REPLY: '{collab.reply}'" if collab.action == "reply" else "LIKE"
-                        print(f"  -> [{sec_id}] Coordinated {act_lbl} on [{primary_name}]'s comment (Scheduled in {delay_mins}m)")
+                        tag = " [first-time poster]" if first_time else ""
+                        print(f"  + [{primary_id}] {collab.action.upper()} (existing FB comment){tag}: {content or '(like)'}")
+                    else:
+                        # No existing comments yet -> draft primary standalone comment
+                        try:
+                            analysis = primary_drafter.analyze(post["text"], first_time_poster=first_time)
+                        except Exception as exc:
+                            store.discard_post(post_id)
+                            if isinstance(exc, primary_drafter.setup_errors):
+                                raise SystemExit(f"AI model setup problem (check API key/model): {exc}")
+                            draft_errors += 1
+                            print(f"  drafting failed, will retry next scan: {exc!r}")
+                            continue
+
+                        if analysis is None:
+                            store.set_status(post_id, "ignored", "model declined to draft")
+                            continue
+                        if not analysis.relevant:
+                            store.save_analysis(post_id, analysis.model_dump(), "ignored")
+                            continue
+
+                        drafted += 1
+                        auto = primary_cfg["post"]["auto_post"]
+                        min_rank = CONFIDENCE_RANK[primary_cfg["post"]["auto_post_min_confidence"]]
+                        is_auto = auto and CONFIDENCE_RANK[analysis.confidence] >= min_rank
+                        status = "approved" if is_auto else "pending"
+                        by = "auto" if is_auto else None
+
+                        store.save_analysis(post_id, analysis.model_dump(), status, primary_agent_id=primary_id)
+                        if is_auto:
+                            store.approve(post_id, analysis.reply, by="auto", primary_agent_id=primary_id)
+                            auto_approved += 1
+
+                        store.add_action(
+                            post_id=post_id,
+                            agent_id=primary_id,
+                            action_type="comment",
+                            content=analysis.reply,
+                            confidence=analysis.confidence,
+                            analysis=analysis.model_dump(),
+                            status=status,
+                            approved_by=by,
+                        )
+                        tag = " [first-time poster]" if first_time else ""
+                        print(f"  + [{primary_id}] {post.get('author_name') or '?'}{tag}: {analysis.reply}")
+
+                # Coordinate secondary agents ONLY once primary comment is approved/posted (never while unreviewed 'pending')
+                if len(agents) > 1 and post.get("text"):
+                    primary_info = store.get_primary_comment(post_id, include_pending=False)
+                    if primary_info:
+                        coordinated_actions += _coordinate_post(
+                            store, post_id, post["text"], agents, drafters, primary_info
+                        )
 
         pending = len(store.pending_actions())
     print(
@@ -217,38 +374,46 @@ def cmd_scan(cfg: dict, args) -> None:
 # ---- review ---------------------------------------------------------------
 
 def cmd_review(cfg: dict, args) -> None:
+    agent_filter = getattr(args, "agent", None)
     with Store() as store:
-        _review(store)
+        _review(store, agent_id=agent_filter)
 
 
-def _review(store: Store) -> None:
-    pending = store.pending_actions()
+def _review(store: Store, agent_id: str | None = None) -> None:
+    pending = store.pending_actions(agent_id=agent_id)
     if not pending:
-        # Fallback to legacy posts table if empty
-        legacy_pending = store.by_status("pending")
-        if not legacy_pending:
+        legacy_pending = store.by_status("pending") if not agent_id else []
+        # Only review legacy rows that don't have agent_actions
+        legacy_only = [
+            r for r in legacy_pending
+            if not store.get_post_actions(r["post_id"])
+        ]
+        if not legacy_only:
             print("Nothing to review.")
             return
-        _review_legacy(store, legacy_pending)
+        _review_legacy(store, legacy_only)
         return
 
     print(f"{len(pending)} actions to review. Keys: [a]pprove  [e]dit  [s]kip  [o]pen post  [q]uit\n")
     for row in pending:
         print("=" * 70)
         action_type = row["action_type"].upper()
-        agent_id = row["agent_id"]
+        aid = row["agent_id"]
         post_url = row["url"]
+        target_comment = row["live_target_comment"] or row["target_comment_text"] or ""
 
         if action_type == "COMMENT":
-            print(f"[{agent_id}] PRIMARY COMMENT on post by {row['post_author'] or '?'}\n{post_url}\n")
+            lbl = "BETTER COMMENT" if row["target_action_id"] or row["target_agent_id"] else "PRIMARY COMMENT"
+            print(f"[{aid}] {lbl} on post by {row['post_author'] or '?'}\n{post_url}\n")
             print((row["post_text"] or "")[:800])
             print(f"\nDraft: {row['content']}")
         elif action_type == "LIKE":
-            print(f"[{agent_id}] LIKE on [{row['target_agent_id']}]'s comment\n{post_url}\n")
-            print(f"Target Comment: {row['target_comment_text']}")
-        elif action_type == "REPLY":
-            print(f"[{agent_id}] THREADED REPLY to [{row['target_agent_id']}]'s comment\n{post_url}\n")
-            print(f"Target Comment: {row['target_comment_text']}")
+            print(f"[{aid}] LIKE on [{row['target_agent_id']}]'s comment\n{post_url}\n")
+            print(f"Target Comment: {target_comment}")
+        elif action_type in ("REPLY", "LIKE_AND_REPLY"):
+            lbl = "LIKE + THREADED REPLY" if action_type == "LIKE_AND_REPLY" else "THREADED REPLY"
+            print(f"[{aid}] {lbl} to [{row['target_agent_id']}]'s comment\n{post_url}\n")
+            print(f"Target Comment: {target_comment}")
             print(f"\nReply Draft: {row['content']}")
 
         while True:
@@ -308,13 +473,24 @@ def cmd_post(cfg: dict, args) -> None:
 
 
 def _post_multi(cfg: dict, args, store: Store) -> None:
-    from .poster import PostError, PostUnverified, like_comment, post_comment, reply_to_comment
+    from .poster import (
+        PostError,
+        PostUnverified,
+        like_and_reply_comment,
+        like_comment,
+        post_comment,
+        reply_to_comment,
+    )
 
     agents = get_agents(cfg)
     target_agent = getattr(args, "agent", None)
-    agents_to_run = [target_agent] if target_agent and target_agent in agents else list(agents.keys())
+    if target_agent and target_agent not in agents:
+        raise SystemExit(f"Unknown agent '{target_agent}'. Configured agents: {', '.join(agents.keys())}")
+    agents_to_run = [target_agent] if target_agent else list(agents.keys())
 
     total_executed = 0
+    newly_posted_primary_posts: list[str] = []
+
     for agent_id in agents_to_run:
         agent_cfg = agents[agent_id]
         pc = agent_cfg["post"]
@@ -325,7 +501,7 @@ def _post_multi(cfg: dict, args, store: Store) -> None:
         room_today = pc["max_per_day"] - store.posted_today_by_agent(agent_id)
         batch = due[: max(0, min(pc["max_per_run"], room_today))]
         if not batch:
-            print(f"[{agent_id}] Daily limit reached or max per run reached.")
+            print(f"[{agent_id}] Daily limit ({pc['max_per_day']}) reached; {len(due)} waiting.")
             continue
 
         print(f"\n--- Posting batch for [{agent_id}] ({len(batch)} actions) ---")
@@ -338,6 +514,7 @@ def _post_multi(cfg: dict, args, store: Store) -> None:
 
                 action_type = act["action_type"]
                 post_url = act["url"]
+                target_comment = act["live_target_comment"] or act["target_comment_text"] or ""
                 print(f"[{agent_id}] Executing {action_type.upper()} on {post_url}")
 
                 try:
@@ -345,45 +522,75 @@ def _post_multi(cfg: dict, args, store: Store) -> None:
                         print(f"  Top-level comment: {act['content']}")
                         post_comment(ctx, post_url, act["content"], pc["comment_box_labels"], dry_run=args.dry_run)
                     elif action_type == "like":
-                        print(f"  Liking comment: {act['target_comment_text'][:40]}...")
-                        like_comment(ctx, post_url, act["target_comment_text"], dry_run=args.dry_run)
+                        print(f"  Liking comment: {target_comment[:45]}...")
+                        like_comment(ctx, post_url, target_comment, dry_run=args.dry_run)
                     elif action_type == "reply":
-                        print(f"  Replying to: {act['target_comment_text'][:40]}... with: {act['content']}")
+                        print(f"  Replying to: {target_comment[:45]}... -> {act['content']}")
                         reply_to_comment(
-                            ctx, post_url, act["target_comment_text"], act["content"],
+                            ctx, post_url, target_comment, act["content"],
+                            pc["comment_box_labels"], dry_run=args.dry_run
+                        )
+                    elif action_type == "like_and_reply":
+                        print(f"  Liking & Replying to: {target_comment[:45]}... -> {act['content']}")
+                        like_and_reply_comment(
+                            ctx, post_url, target_comment, act["content"],
                             pc["comment_box_labels"], dry_run=args.dry_run
                         )
 
                     if not args.dry_run:
                         store.mark_action_executed(act["action_id"])
-                        if action_type == "comment":
-                            store.mark_posted(act["post_id"])
                         total_executed += 1
+                        if action_type == "comment":
+                            newly_posted_primary_posts.append(act["post_id"])
                         print("  Success")
                 except PostUnverified as exc:
                     if not args.dry_run:
                         store.mark_action_executed(act["action_id"], unverified_error=str(exc))
+                        if action_type == "comment":
+                            newly_posted_primary_posts.append(act["post_id"])
                     print(f"  Unverified: {exc}")
                 except PostError as exc:
                     if not args.dry_run:
                         store.set_action_status(act["action_id"], "failed", error=str(exc))
                     print(f"  Failed: {exc}")
 
-    # Fallback for any legacy approved comments in posts table
-    legacy_approved = store.by_status("approved")
-    if legacy_approved and not total_executed:
+    # Legacy queue (only posts without agent_actions rows)
+    legacy_approved = store.legacy_approved()
+    if legacy_approved and not target_agent:
         print("Checking legacy queue...")
-        _post_legacy(cfg, args, store)
+        _post_legacy(cfg, args, store, legacy_approved)
+
+    # After primary comments go live, trigger secondary agents' offline collaboration evaluation
+    if not args.dry_run and newly_posted_primary_posts and len(agents) > 1:
+        _coordinate_after_post(agents, store, newly_posted_primary_posts)
 
     if not args.dry_run:
         store.export_history(HISTORY_CSV)
 
 
-def _post_legacy(cfg: dict, args, store: Store) -> None:
+def _coordinate_after_post(agents: dict[str, dict], store: Store, post_ids: list[str]) -> None:
+    """Evaluate collaboration for secondary agents right after a primary comment is posted."""
+    from .drafter import Drafter
+
+    drafters = {aid: Drafter(acfg) for aid, acfg in agents.items()}
+    total_planned = 0
+    for post_id in set(post_ids):
+        post = store.get_post(post_id)
+        if not post or not post["text"]:
+            continue
+        primary_info = store.get_primary_comment(post_id, include_pending=False)
+        if not primary_info:
+            continue
+        total_planned += _coordinate_post(store, post_id, post["text"], agents, drafters, primary_info)
+    if total_planned:
+        pending = len(store.pending_actions())
+        print(f"Coordinated {total_planned} follow-up agent action(s). Pending review: {pending}")
+
+
+def _post_legacy(cfg: dict, args, store: Store, approved: list) -> None:
     from .poster import PostError, PostUnverified, post_comment
 
     pc = cfg["post"]
-    approved = store.by_status("approved")
     room_today = pc["max_per_day"] - store.posted_today()
     batch = approved[: max(0, min(pc["max_per_run"], room_today))]
     if not batch:
@@ -444,29 +651,39 @@ def cmd_status(cfg: dict, args) -> None:
         for aid, acfg in agents.items():
             posted = store.posted_today_by_agent(aid)
             due = len(store.due_actions(agent_id=aid))
-            pending = len([a for a in store.pending_actions() if a["agent_id"] == aid])
+            waiting_delay = store.waiting_delay_count(aid)
+            pending = len(store.pending_actions(agent_id=aid))
             max_d = acfg["post"]["max_per_day"]
-            print(f"  [{aid}] '{acfg.get('name', aid)}': {posted}/{max_d} actions today | {due} ready to post | {pending} pending review")
+            print(
+                f"  [{aid}] '{acfg.get('name', aid)}': {posted}/{max_d} posted today | "
+                f"{due} ready now | {waiting_delay} waiting delay | {pending} pending review"
+            )
 
         print("\nRecent Issues:")
-        for status in ("failed", "unverified"):
-            for row in store.by_status(status)[-3:]:
-                print(f"  {status}: {row['url']} -> {row['error']}")
+        issues = store.recent_action_issues(limit=5)
+        for row in issues:
+            print(f"  [{row['agent_id']}] {row['action_type']} {row['status']}: {row['url']} -> {row['error']}")
+        if not issues:
+            for status in ("failed", "unverified"):
+                for row in store.by_status(status)[-3:]:
+                    print(f"  {status}: {row['url']} -> {row['error']}")
 
 
 def cmd_history(cfg: dict, args) -> None:
-    """Show the posts the bot commented on, newest first, and refresh the CSV."""
+    """Show the posts and engagements the swarm executed, newest first, and refresh the CSV."""
     with Store() as store:
         rows = store.history(limit=args.limit)
         total = store.export_history(HISTORY_CSV)
     if not rows:
-        print("No comments posted yet.")
+        print("No comments or engagements posted yet.")
         return
     for r in rows:
         mark = "" if r["status"] == "posted" else f"  [{r['status']}]"
-        print(f"{r['posted_at']}  {r['author_name'] or '?'}  ({r['approved_by'] or '?'}){mark}")
-        print(f"  post:    {(r['text'] or '').replace(chr(10), ' ')[:110]}")
-        print(f"  comment: {r['final_comment']}")
+        act = r["action_type"].upper()
+        print(f"{r['commented_at']}  [{r['agent_id']}] {act}  on {r['author_name'] or '?'}  ({r['approved_by'] or '?'}){mark}")
+        print(f"  post:    {(r['post_text'] or '').replace(chr(10), ' ')[:110]}")
+        if r["final_comment"]:
+            print(f"  comment: {r['final_comment']}")
         print(f"  {r['url']}\n")
     print(f"Showing {len(rows)} of {total}. Full history: {HISTORY_CSV}")
 
@@ -477,6 +694,8 @@ def cmd_try(cfg: dict, args) -> None:
 
     agents = get_agents(cfg)
     agent_id = getattr(args, "agent", None) or list(agents.keys())[0]
+    if agent_id not in agents:
+        raise SystemExit(f"Unknown agent '{agent_id}'. Configured agents: {', '.join(agents.keys())}")
     drafter = Drafter(agents[agent_id])
 
     if args.existing_comment:
@@ -501,15 +720,18 @@ def main(argv: list[str] | None = None) -> None:
     p_login.add_argument("--agent", help="agent id to log in (e.g. agent_1, agent_2)")
 
     p_scan = sub.add_parser("scan", help="find new posts and coordinate drafts among agents")
+    p_scan.add_argument("--agent", help="force a specific agent to scout and take primary comments")
     p_scan.add_argument("--debug", action="store_true", help="save raw Facebook data to data/debug/")
 
-    sub.add_parser("review", help="approve, edit or skip drafted comments, likes and replies")
+    p_review = sub.add_parser("review", help="approve, edit or skip drafted comments, likes and replies")
+    p_review.add_argument("--agent", help="filter pending items for a specific agent")
 
     p_post = sub.add_parser("post", help="post approved comments, likes and replies")
     p_post.add_argument("--agent", help="only execute actions for this specific agent")
     p_post.add_argument("--dry-run", action="store_true", help="open posts and find buttons, do not click or type")
 
     p_run = sub.add_parser("run", help="scan, coordinate, then execute actions")
+    p_run.add_argument("--agent", help="force a specific agent for primary scouting/posting")
     p_run.add_argument("--debug", action="store_true")
     p_run.add_argument("--dry-run", action="store_true")
 
@@ -526,7 +748,7 @@ def main(argv: list[str] | None = None) -> None:
     p_try = sub.add_parser("try", help="draft a reply or test collaborative reaction without Facebook")
     p_try.add_argument("text")
     p_try.add_argument("--agent", help="which agent should test")
-    p_try.add_argument("--existing-comment", help="existing comment text to test collaboration (like/reply)")
+    p_try.add_argument("--existing-comment", help="existing comment text to test collaboration (like/reply/comment)")
     p_try.add_argument("--primary-name", help="name of commenter who posted existing comment")
 
     args = parser.parse_args(argv)

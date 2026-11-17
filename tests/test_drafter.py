@@ -34,6 +34,19 @@ class ExtractJsonTest(unittest.TestCase):
         self.assertEqual(c.action, "like")
         self.assertEqual(c.reply, "")
 
+    def test_collaboration_like_and_reply_and_better_comment(self):
+        c1 = CollaborationAnalysis.model_validate_json(
+            '{"action": "like_and_reply", "reply": "Agreed, also go before 8pm!", "confidence": "high", "reason": "Extra tip"}'
+        )
+        self.assertEqual(c1.action, "like_and_reply")
+        self.assertEqual(c1.reply, "Agreed, also go before 8pm!")
+
+        c2 = CollaborationAnalysis.model_validate_json(
+            '{"action": "comment", "reply": "Better standalone advice here.", "confidence": "high", "reason": "Missed main question"}'
+        )
+        self.assertEqual(c2.action, "comment")
+        self.assertEqual(c2.reply, "Better standalone advice here.")
+
     def test_clean_removes_newlines_and_quotes(self):
         self.assertEqual(_clean('"Take the metro.\nIt is fast."'), "Take the metro. It is fast.")
 

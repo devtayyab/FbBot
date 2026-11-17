@@ -5,12 +5,13 @@ The bot automates engagement in Facebook travel and community groups from real F
 
 It can operate in two modes:
 1. **Single-Agent Mode**: Reads posts in target groups, drafts helpful 1-2 sentence replies using local notes (`knowledge.md`), and posts comments after approval or auto-approval.
-2. **Multi-Agent Swarm Mode (Coordinated Team)**: Multiple agents/accounts collaborate organically on posts without spamming:
-   - **Primary Agent**: Detects new traveler inquiries and posts an authoritative, friendly answer.
-   - **Secondary Agent(s)**: Inspects the post and the primary agent's comment:
-     - **LIKE**: If the answer is already complete, the secondary agent Likes the comment to boost its algorithm ranking and social proof.
-     - **THREADED REPLY**: If the secondary agent can add a complementary tip (e.g. agreeing and adding a specific local recommendation), it posts a nested reply to the primary comment after a natural human delay (e.g. 15-30 minutes).
-     - **SKIP**: If the post is not relevant or already saturated, it skips to prevent unnecessary clutter.
+2. **Multi-Agent Swarm Mode (Coordinated Team)**: Multiple agents/accounts rotate primary answering and collaborate organically on posts without spamming:
+   - **Primary Agent (Round-Robin Rotation)**: Picks up new traveler posts (unless comments already exist) and posts an authoritative, friendly answer.
+   - **Secondary Agent(s)**: Inspects the post and the existing comment(s):
+     - **BETTER COMMENT**: Only if the existing comment missed key info and the agent can write a clearly better standalone answer.
+     - **LIKE + THREADED REPLY**: Likes the existing comment AND posts a short nested reply underneath with a complementary local tip after a natural delay (e.g. 15+ minutes).
+     - **LIKE**: If the answer is already complete, likes the comment to boost its ranking and social proof.
+     - **SKIP**: If the post is not relevant or already saturated, skips to prevent clutter.
 
 ---
 
@@ -18,21 +19,23 @@ It can operate in two modes:
 
 ```mermaid
 flowchart TD
-    A["Post Scanned from Group Feed"] --> B{"Has an agent commented?"}
+    A["Post Scanned from Group Feed"] --> B{"Existing comment present?"}
     
-    B -- "No (New Post)" --> C["Primary Agent (e.g. Agent 1)\nDrafts helpful answer based on knowledge.md"]
-    C --> D["Store in agent_actions\nstatus: pending or approved"]
-    D --> E["Primary Agent posts top-level comment"]
+    B -- "No (New Post)" --> C["Primary Agent (Round-Robin)\nDrafts helpful answer based on knowledge.md"]
+    C --> D["Approved & Posted on Facebook"]
     
-    B -- "Yes (Primary Comment exists)" --> F["Secondary Agent AI Evaluation\n(Post text + Primary comment)"]
+    B -- "Yes (Primary or FB Comment exists)" --> F["Next Agent AI Evaluation\n(Post + Existing comment + Replies)"]
+    D --> F
     F --> G{"AI Collaboration Decision"}
     
-    G -- "Existing answer is great" --> H["Action: LIKE\nSecondary agent likes primary comment"]
-    G -- "Can add complementary tip" --> I["Action: THREADED REPLY\nReplies directly under primary comment:\n'Totally agree, also check out XYZ!'"]
+    G -- "Can write clearly better answer" --> H1["Action: BETTER COMMENT\nPosts superior standalone comment"]
+    G -- "Good answer + extra tip" --> H2["Action: LIKE + THREADED REPLY\nLikes comment & replies underneath"]
+    G -- "Existing answer is complete" --> H3["Action: LIKE\nLikes existing comment only"]
     G -- "No value add needed" --> J["Action: SKIP\nIgnored to prevent spam"]
     
-    H --> K["Execute after natural delay (e.g. 15-30m)"]
-    I --> K
+    H1 --> K["Execute after natural delay (anchored to live post time)"]
+    H2 --> K
+    H3 --> K
 ```
 
 ---
@@ -84,6 +87,8 @@ pip install -r requirements.txt
          min_delay_after_primary_mins: 15
          allow_like: true
          allow_reply: true
+         allow_like_and_reply: true
+         allow_better_comment: true
    ```
 3. Copy `.env.example` to `.env` and fill in your API key (`DASHSCOPE_API_KEY` for Qwen or `ANTHROPIC_API_KEY` for Claude).
 
@@ -99,7 +104,7 @@ python bot.py login --agent agent_2   # Log in to Account 2
 ```
 
 ### Scan & Coordinate Actions
-Scans target groups, drafts top-level replies for primary agent, and coordinates Likes/Replies for secondary agents:
+Scans target groups, rotates primary drafting across agents, and coordinates better comments / Likes+Replies:
 ```bash
 python bot.py scan
 ```
@@ -122,6 +127,8 @@ python bot.py post --dry-run     # Test without typing or clicking
 ```bash
 python bot.py run                # 1 scan + post cycle
 python bot.py loop --minutes 60  # Continuous hourly loop
+# Windows Task Scheduler: scripts/hourly.ps1
+# macOS launchd: scripts/hourly.sh + scripts/com.fbbot.hourly.plist
 ```
 
 ### Status & History

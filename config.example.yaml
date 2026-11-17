@@ -41,10 +41,10 @@ post:
 
 # ----------------------------------------------------------------------------
 # Multi-Agent Swarm Configuration (Optional)
-# If defined, the bot runs as a coordinated team:
-# - Primary agent drafts the top-level response.
-# - Secondary agents evaluate whether to LIKE the primary comment or add a
-#   THREADED REPLY with complementary tips, after a natural delay.
+# If defined, the bot rotates primary commenting across agents and coordinates reactions:
+# - Primary agent drafts the top-level response (or collaborates if Facebook comments exist).
+# - Secondary agents evaluate whether they can post a BETTER standalone comment, OR
+#   LIKE + THREADED REPLY to the existing comment, OR just LIKE, after a natural delay.
 # ----------------------------------------------------------------------------
 agents:
   agent_1:
@@ -59,6 +59,12 @@ agents:
       max_per_day: 15
       min_delay_seconds: 90
       max_delay_seconds: 240
+    collaboration:
+      min_delay_after_primary_mins: 15
+      allow_like: true
+      allow_reply: true
+      allow_like_and_reply: true
+      allow_better_comment: true
 
   agent_2:
     name: "Hamza (Culture & Sights)"
@@ -73,6 +79,8 @@ agents:
       min_delay_seconds: 90
       max_delay_seconds: 240
     collaboration:
-      min_delay_after_primary_mins: 15  # wait at least 15m after primary comment before liking/replying
-      allow_like: true                  # can like primary agent's comment
-      allow_reply: true                 # can post threaded reply to primary comment
+      min_delay_after_primary_mins: 15  # wait at least 15m after primary comment before reacting
+      allow_like: true                  # can like existing comment
+      allow_reply: true                 # can post threaded reply to existing comment
+      allow_like_and_reply: true        # can like AND reply in one visit
+      allow_better_comment: true        # can post a better standalone comment if existing one missed key info
