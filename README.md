@@ -7,11 +7,15 @@ It can operate in two modes:
 1. **Single-Agent Mode**: Reads posts in target groups, drafts helpful 1-2 sentence replies using local notes (`knowledge.md`), and posts comments after approval or auto-approval.
 2. **Multi-Agent Swarm Mode (Coordinated Team)**: Multiple agents/accounts rotate primary answering and collaborate organically on posts without spamming:
    - **Primary Agent (Round-Robin Rotation)**: Picks up new traveler posts (unless comments already exist) and posts an authoritative, friendly answer.
-   - **Secondary Agent(s)**: Inspects the post and the existing comment(s):
-     - **BETTER COMMENT**: Only if the existing comment missed key info and the agent can write a clearly better standalone answer.
-     - **LIKE + THREADED REPLY**: Likes the existing comment AND posts a short nested reply underneath with a complementary local tip after a natural delay (e.g. 15+ minutes).
-     - **LIKE**: If the answer is already complete, likes the comment to boost its ranking and social proof.
-     - **SKIP**: If the post is not relevant or already saturated, skips to prevent clutter.
+   - **Secondary Agent(s)** checking a teammate's comment act only when their own notes give a **more accurate answer**. Teammates never like each other's comments and never post "agree + tip" replies:
+     - **MORE ACCURATE COMMENT**: The teammate's comment missed or got wrong the main question, and this agent's notes hold the correct answer.
+     - **CORRECTING REPLY**: The comment is mostly right but one fact is wrong or missing; a short threaded reply adds just that fact.
+     - **SKIP** (the default): The comment is accurate and sufficient, or the notes add nothing more precise.
+   - **Comments from real group members** (not our agents) are handled as before: a better comment, a like, a like + threaded reply, or skip.
+
+   Give each agent its own `knowledge_file` if you want them to know different things; with the same notes a second agent will almost always skip.
+
+   The diagram below predates this rule: its LIKE and LIKE + THREADED REPLY branches now apply only to comments from real group members.
 
 ---
 

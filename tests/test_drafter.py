@@ -51,5 +51,46 @@ class ExtractJsonTest(unittest.TestCase):
         self.assertEqual(_clean('"Take the metro.\nIt is fast."'), "Take the metro. It is fast.")
 
 
+class PeerCollaborationTest(unittest.TestCase):
+    """Between teammates the only outcomes are comment, reply or skip, whatever the model says."""
+
+    def _run(self, answer: dict):
+        import json as _json
+        from fbbot.drafter import Drafter
+
+        class FakeBackend:
+            def complete(self, user, system_override=None, schema_override=None):
+                self.system, self.schema = system_override, schema_override
+                return _json.dumps(answer)
+
+        d = Drafter.__new__(Drafter)
+        d.provider, d.destination, d.persona, d.max_words, d.knowledge = "claude", "Lahore", "a local", 40, "notes"
+        d._backend = FakeBackend()
+        return d, d.analyze_collaboration("post", "existing", "Ali", peer=True)
+
+    def test_like_becomes_skip(self):
+        _, out = self._run({"action": "like", "reply": "", "confidence": "high", "reason": "complete"})
+        self.assertEqual(out.action, "skip")
+
+    def test_like_and_reply_loses_the_like(self):
+        _, out = self._run(
+            {"action": "like_and_reply", "reply": "It opens at 6pm, not 4pm.", "confidence": "high", "reason": "hours"}
+        )
+        self.assertEqual(out.action, "reply")
+
+    def test_empty_text_is_skip(self):
+        _, out = self._run({"action": "comment", "reply": "", "confidence": "high", "reason": ""})
+        self.assertEqual(out.action, "skip")
+
+    def test_peer_prompt_and_schema_are_used(self):
+        from fbbot.drafter import PEER_SCHEMA
+        d, out = self._run(
+            {"action": "comment", "reply": "Fare is 500, agree it first.", "confidence": "high", "reason": "fare"}
+        )
+        self.assertEqual(out.action, "comment")
+        self.assertIs(d._backend.schema, PEER_SCHEMA)
+        self.assertIn("MORE ACCURATE", d._backend.system)
+
+
 if __name__ == "__main__":
     unittest.main()

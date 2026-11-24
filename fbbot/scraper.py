@@ -103,20 +103,29 @@ def _extract_story_comments(story_obj: dict) -> list[dict]:
     """Extract preview/existing comments nested inside a Story JSON payload."""
     comments: list[dict] = []
     seen_texts: set[str] = set()
-    for node in _walk(story_obj):
-        if node.get("__typename") != "Comment":
+    # Walk in document order (Facebook's own order) and remember whether we are inside
+    # another comment: a Comment nested in a Comment is a threaded reply.
+    stack: list[tuple[object, bool]] = [(story_obj, False)]
+    while stack:
+        cur, inside_comment = stack.pop()
+        if isinstance(cur, list):
+            stack.extend((v, inside_comment) for v in reversed(cur))
             continue
-        body = node.get("body") or node.get("preferred_body") or {}
-        text = body.get("text") if isinstance(body, dict) else None
-        if not isinstance(text, str) or not text.strip():
+        if not isinstance(cur, dict):
             continue
-        clean_text = text.strip()
-        if clean_text in seen_texts:
-            continue
-        seen_texts.add(clean_text)
-        author = node.get("author")
-        author_name = author.get("name") if isinstance(author, dict) else None
-        comments.append({"author": author_name or "Someone", "text": clean_text})
+        is_comment = cur.get("__typename") == "Comment"
+        if is_comment:
+            body = cur.get("body") or cur.get("preferred_body") or {}
+            text = body.get("text") if isinstance(body, dict) else None
+            if isinstance(text, str) and text.strip() and text.strip() not in seen_texts:
+                seen_texts.add(text.strip())
+                author = cur.get("author")
+                author_name = author.get("name") if isinstance(author, dict) else None
+                comments.append(
+                    {"author": author_name or "Someone", "text": text.strip(), "is_reply": inside_comment}
+                )
+        children = [v for k, v in cur.items() if k not in SKIP_KEYS]
+        stack.extend((v, inside_comment or is_comment) for v in reversed(children))
     return comments
 
 

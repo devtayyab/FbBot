@@ -104,6 +104,40 @@ class StoreMultiAgentTest(unittest.TestCase):
         actions = {r["action_id"]: r for r in self.store.get_post_actions("p200")}
         self.assertEqual(actions[act2]["status"], "skipped")
 
+    def test_like_on_existing_comment_never_enters_legacy_queue(self):
+        post = {"post_id": "p300", "url": "https://www.facebook.com/groups/g/posts/300", "text": "q"}
+        self.store.add_post(post, "g", "new")
+        # what scan stores for an auto-approved like+reply on another member's comment
+        self.store.save_analysis("p300", {"action": "like_and_reply", "reply": "tip"}, "engaged", primary_agent_id="agent_1")
+        act = self.store.add_action(
+            post_id="p300", agent_id="agent_1", action_type="like_and_reply", content="tip",
+            target_comment_text="existing answer", status="approved", approved_by="auto",
+        )
+        self.assertEqual(self.store.legacy_approved(), [])
+        self.assertIsNone(self.store.get_primary_comment("p300"))
+        self.assertEqual(len(self.store.due_actions(agent_id="agent_1")), 1)
+        self.store.mark_action_executed(act)
+        self.assertEqual(self.store.get_post("p300")["status"], "engaged")
+        self.assertEqual(self.store.by_status("pending"), [])
+
+    def test_approved_post_without_comment_text_is_not_legacy(self):
+        post = {"post_id": "p301", "url": "https://www.facebook.com/groups/g/posts/301", "text": "q"}
+        self.store.add_post(post, "g", "approved")
+        self.assertEqual(self.store.legacy_approved(), [])
+
+    def test_likes_count_toward_daily_cap(self):
+        post = {"post_id": "p302", "url": "https://www.facebook.com/groups/g/posts/302", "text": "q"}
+        self.store.add_post(post, "g", "engaged")
+        act = self.store.add_action(post_id="p302", agent_id="agent_1", action_type="like", status="approved")
+        self.store.mark_action_executed(act)
+        self.assertEqual(self.store.posted_today_by_agent("agent_1"), 1)
+
+    def test_discard_unfinished_retries_interrupted_posts(self):
+        post = {"post_id": "p303", "url": "https://www.facebook.com/groups/g/posts/303", "text": "q", "author_id": "u1"}
+        self.store.add_post(post, "g", "new")
+        self.assertEqual(self.store.discard_unfinished(), 1)
+        self.assertFalse(self.store.has_post("p303"))
+
 
 if __name__ == "__main__":
     unittest.main()

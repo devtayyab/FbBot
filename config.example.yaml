@@ -2,7 +2,7 @@
 #
 # You can run this bot in two modes:
 # 1. Single Agent (simple default)
-# 2. Multi-Agent Swarm (coordinated accounts with like & threaded reply synergy)
+# 2. Multi-Agent (several accounts share the posts; a second agent speaks only with a more accurate answer)
 
 # Facebook groups to watch: the full group URL from your browser
 groups:
@@ -44,7 +44,9 @@ post:
 # If defined, the bot rotates primary commenting across agents and coordinates reactions:
 # - Primary agent drafts the top-level response (or collaborates if Facebook comments exist).
 # - Secondary agents evaluate whether they can post a BETTER standalone comment, OR
-#   LIKE + THREADED REPLY to the existing comment, OR just LIKE, after a natural delay.
+#   LIKE + THREADED REPLY to the existing comment, OR just LIKE (real members' comments only).
+# - On a TEAMMATE's comment an agent never likes or agrees: it posts only when its own notes
+#   give a more accurate answer (standalone comment or a correcting reply), otherwise it skips.
 # ----------------------------------------------------------------------------
 agents:
   agent_1:
@@ -61,9 +63,7 @@ agents:
       max_delay_seconds: 240
     collaboration:
       min_delay_after_primary_mins: 15
-      allow_like: true
       allow_reply: true
-      allow_like_and_reply: true
       allow_better_comment: true
 
   agent_2:
@@ -80,7 +80,5 @@ agents:
       max_delay_seconds: 240
     collaboration:
       min_delay_after_primary_mins: 15  # wait at least 15m after primary comment before reacting
-      allow_like: true                  # can like existing comment
-      allow_reply: true                 # can post threaded reply to existing comment
-      allow_like_and_reply: true        # can like AND reply in one visit
-      allow_better_comment: true        # can post a better standalone comment if existing one missed key info
+      allow_reply: true                 # may add a correcting threaded reply under a teammate's comment
+      allow_better_comment: true        # may post a more accurate standalone comment

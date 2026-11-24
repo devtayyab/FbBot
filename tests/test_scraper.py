@@ -75,14 +75,24 @@ class ExtractTest(unittest.TestCase):
             "feedback": {
                 "display_comments": {
                     "edges": [
-                        {"node": {"__typename": "Comment", "author": {"name": "Bilal"}, "body": {"text": "Try Gulberg!"}}}
+                        {"node": {
+                            "__typename": "Comment", "author": {"name": "Bilal"}, "body": {"text": "Try Gulberg!"},
+                            "feedback": {"replies": {"edges": [
+                                {"node": {"__typename": "Comment", "author": {"name": "Sana"}, "body": {"text": "Agreed"}}}
+                            ]}},
+                        }},
+                        {"node": {"__typename": "Comment", "author": {"name": "Omar"}, "body": {"text": "Or Johar Town"}}},
                     ]
                 }
             },
         }
         posts = extract_posts(story)
         self.assertIn("333", posts)
-        self.assertEqual(posts["333"]["comments"], [{"author": "Bilal", "text": "Try Gulberg!"}])
+        self.assertEqual(posts["333"]["comments"], [
+            {"author": "Bilal", "text": "Try Gulberg!", "is_reply": False},
+            {"author": "Sana", "text": "Agreed", "is_reply": True},
+            {"author": "Omar", "text": "Or Johar Town", "is_reply": False},
+        ])
 
 
 if __name__ == "__main__":

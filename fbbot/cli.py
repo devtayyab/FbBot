@@ -59,7 +59,11 @@ def _coordinate_post(
     drafters: dict,
     primary_info: dict,
 ) -> int:
-    """Have other agents evaluate an approved/posted comment and decide: better comment, like+reply, like, or skip."""
+    """Let the other agents check a teammate's approved/posted comment.
+
+    A teammate never likes or simply agrees: it acts only when its notes give a more accurate
+    answer (standalone comment, or a correcting threaded reply). Otherwise it skips.
+    """
     primary_content = primary_info["content"]
     primary_owner = primary_info.get("agent_id", "default")
     primary_action_id = primary_info.get("action_id")
@@ -80,6 +84,7 @@ def _coordinate_post(
                 primary_comment=primary_content,
                 primary_agent_name=primary_name,
                 existing_replies=existing_replies,
+                peer=True,
             )
         except Exception as exc:
             if isinstance(exc, sec_drafter.setup_errors):
@@ -99,21 +104,12 @@ def _coordinate_post(
             continue
 
         action = collab.action
-        # Respect agent collaboration feature flags cleanly
+        # Respect the agent's feature flags. Between teammates only 'comment' and 'reply' exist.
         if action == "comment" and not collab_cfg.get("allow_better_comment", True):
-            action = "like_and_reply" if collab.reply else "like"
-        if action == "like_and_reply":
-            allow_like = collab_cfg.get("allow_like", True)
-            allow_reply = collab_cfg.get("allow_reply", True)
-            if not collab_cfg.get("allow_like_and_reply", True) or (not allow_like and allow_reply):
-                action = "reply" if allow_reply else ("like" if allow_like else "skip")
-            elif allow_like and not allow_reply:
-                action = "like"
-            elif not allow_like and not allow_reply:
-                action = "skip"
-        elif action == "reply" and not collab_cfg.get("allow_reply", True):
-            action = "like" if collab_cfg.get("allow_like", True) else "skip"
-        elif action == "like" and not collab_cfg.get("allow_like", True):
+            action = "reply"
+        if action == "reply" and not collab_cfg.get("allow_reply", True):
+            action = "skip"
+        if action not in ("comment", "reply"):
             action = "skip"
 
         if action == "skip":
@@ -160,10 +156,8 @@ def _coordinate_post(
         )
         created_count += 1
         labels = {
-            "comment": f"BETTER COMMENT: '{content}'",
-            "like_and_reply": f"LIKE + REPLY: '{content}'",
-            "reply": f"REPLY: '{content}'",
-            "like": "LIKE",
+            "comment": f"MORE ACCURATE COMMENT: '{content}'",
+            "reply": f"CORRECTING REPLY: '{content}'",
         }
         print(f"  -> [{sec_id}] Planned {labels.get(action, action)} on [{primary_name}] (delay {delay_mins}m)")
 
@@ -224,6 +218,9 @@ def cmd_scan(cfg: dict, args) -> None:
 
     with Store() as store, _browser(scout_cfg, agent_id=scout_id) as ctx:
         baseline = store.is_empty()
+        stale = store.discard_unfinished()
+        if stale:
+            print(f"Retrying {stale} post(s) left unfinished by an interrupted scan.")
         rotation_idx = store.total_posts()
 
         for group_url in cfg["groups"]:
@@ -257,13 +254,14 @@ def cmd_scan(cfg: dict, args) -> None:
                     if ext_comments:
                         # Existing comment(s) from Facebook members already present!
                         # Evaluate whether primary agent can write a better comment or like+reply.
-                        first_ext = ext_comments[0]
+                        top_level = [c for c in ext_comments if not c.get("is_reply")] or ext_comments
+                        first_ext = top_level[0]
                         try:
                             collab = primary_drafter.analyze_collaboration(
                                 post_text=post["text"],
                                 primary_comment=first_ext["text"],
                                 primary_agent_name=first_ext.get("author") or "a group member",
-                                existing_replies=[c["text"] for c in ext_comments[1:]],
+                                existing_replies=[c["text"] for c in ext_comments if c is not first_ext],
                             )
                         except Exception as exc:
                             store.discard_post(post_id)
@@ -289,7 +287,11 @@ def cmd_scan(cfg: dict, args) -> None:
                         by = "auto" if is_auto else None
                         content = collab.reply if collab.action in ("comment", "reply", "like_and_reply") else ""
 
-                        store.save_analysis(post_id, collab.model_dump(), status, primary_agent_id=primary_id)
+                        # Only a top-level comment makes the post itself pending/approved. A like or
+                        # threaded reply lives in agent_actions alone; the post is just 'engaged', so the
+                        # legacy queue and the secondary agents never mistake it for a primary comment.
+                        post_status = status if collab.action == "comment" else "engaged"
+                        store.save_analysis(post_id, collab.model_dump(), post_status, primary_agent_id=primary_id)
                         if collab.action == "comment" and is_auto:
                             store.approve(post_id, content, by="auto", primary_agent_id=primary_id)
                             auto_approved += 1
@@ -704,6 +706,7 @@ def cmd_try(cfg: dict, args) -> None:
             post_text=args.text,
             primary_comment=args.existing_comment,
             primary_agent_name=args.primary_name or "Ali",
+            peer=args.peer,
         )
         print(collab.model_dump_json(indent=2) if collab else "Declined.")
     else:
@@ -750,6 +753,13 @@ def main(argv: list[str] | None = None) -> None:
     p_try.add_argument("--agent", help="which agent should test")
     p_try.add_argument("--existing-comment", help="existing comment text to test collaboration (like/reply/comment)")
     p_try.add_argument("--primary-name", help="name of commenter who posted existing comment")
+    p_try.add_argument("--peer", action="store_true",
+                       help="treat the existing comment as a teammate's (act only with a more accurate answer)")
+
+    # Windows consoles and redirected logs default to cp1252, which cannot print Urdu or emoji.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure") and (stream.encoding or "").lower().replace("-", "") != "utf8":
+            stream.reconfigure(encoding="utf-8", errors="replace")
 
     args = parser.parse_args(argv)
     needs_groups = args.command in ("scan", "run", "loop")

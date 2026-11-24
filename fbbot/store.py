@@ -4,6 +4,7 @@ Post status flow:
     ignored              not a visitor/question, too old, or no text
     pending  -> approved -> posted | unverified | failed
              -> skipped
+    engaged              only a like / threaded reply is planned (tracked in agent_actions)
 
 Multi-agent action flow (`agent_actions`):
     pending  -> approved -> posted | unverified | failed
@@ -201,6 +202,13 @@ class Store:
         self.db.execute("DELETE FROM posts WHERE post_id = ?", (post_id,))
         self.db.commit()
 
+    def discard_unfinished(self) -> int:
+        """Drop posts stuck in 'new' (scan was interrupted mid-draft) so they are drafted again."""
+        rows = self.db.execute("SELECT post_id FROM posts WHERE status = 'new'").fetchall()
+        for row in rows:
+            self.discard_post(row["post_id"])
+        return len(rows)
+
     def save_analysis(self, post_id: str, analysis: dict, status: str, primary_agent_id: str | None = None) -> None:
         self.db.execute(
             "UPDATE posts SET analysis = ?, draft = ?, status = ?, primary_agent_id = COALESCE(?, primary_agent_id) WHERE post_id = ?",
@@ -220,6 +228,7 @@ class Store:
         return self.db.execute(
             """SELECT p.* FROM posts p
                WHERE p.status = 'approved'
+                 AND p.final_comment IS NOT NULL AND p.final_comment != ''
                  AND NOT EXISTS (
                      SELECT 1 FROM agent_actions a WHERE a.post_id = p.post_id AND a.action_type = 'comment'
                  )
@@ -584,7 +593,7 @@ class Store:
         row = self.db.execute(
             """SELECT COUNT(*) FROM agent_actions
                WHERE agent_id = ? AND executed_at IS NOT NULL
-                 AND action_type IN ('comment', 'reply', 'like_and_reply')
+                 AND action_type IN ('comment', 'reply', 'like_and_reply', 'like')
                  AND substr(executed_at, 1, 10) = ?""",
             (agent_id, today),
         ).fetchone()
